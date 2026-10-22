@@ -1,4 +1,5 @@
 rootProject.name = 'distributed-api-gateway'
 
 include 'gateway:gateway-core'
+include 'gateway:gateway-ratelimit'
 include 'gateway:gateway-runtime'

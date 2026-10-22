@@ -43,6 +43,11 @@ services:
     ports:
       - "8083:8083"
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
   gateway:
     build:
       context: .
@@ -51,9 +56,11 @@ services:
       CUSTOMERS_SERVICE_URL: http://customers-service:8081
       VISITS_SERVICE_URL: http://visits-service:8082
       VETS_SERVICE_URL: http://vets-service:8083
+      REDIS_URL: redis://redis:6379
     ports:
       - "8080:8080"
     depends_on:
       - customers-service
       - visits-service
       - vets-service
+      - redis

@@ -4,6 +4,7 @@ plugins {
 
 dependencies {
     implementation project(':gateway:gateway-core')
+    implementation project(':gateway:gateway-ratelimit')
 }
 
 application {
