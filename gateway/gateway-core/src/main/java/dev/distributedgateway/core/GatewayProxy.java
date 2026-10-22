@@ -23,7 +23,7 @@ import reactor.netty.http.server.HttpServerResponse;
 public final class GatewayProxy {
     private static final Set<String> HOP_HEADERS = Set.of(
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-            "te", "trailer", "transfer-encoding", "upgrade", "host");
+            "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "host");
 
     private final List<GatewayRoute> routes;
     private final Map<String, RateLimitPolicy> rateLimitPolicies;

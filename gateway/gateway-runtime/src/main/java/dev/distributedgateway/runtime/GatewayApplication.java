@@ -51,6 +51,7 @@ public final class GatewayApplication {
         }
         DisposableServer server = new GatewayProxy(routes, timeout,
                 policies, new LocalTokenBucketRateLimiter()).start(port);
+        Runtime.getRuntime().addShutdownHook(new Thread(server::disposeNow));
         System.out.printf("Gateway listening on http://localhost:%d; routes: %s%n", server.port(), routes);
         server.onDispose().block();
     }

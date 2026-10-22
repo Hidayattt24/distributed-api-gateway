@@ -1,6 +1,7 @@
 package dev.distributedgateway.core;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.URI;
@@ -9,6 +10,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Mono;
@@ -49,6 +51,10 @@ class GatewayProxyTest {
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(404, missing.statusCode());
             assertTrue(missing.body().contains("No matching route"));
+
+            var extraPrefix = client.send(HttpRequest.newBuilder(URI.create(base + "/users-extra")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(404, extraPrefix.statusCode());
         } finally {
             gateway.disposeNow();
             backend.disposeNow();
@@ -103,6 +109,79 @@ class GatewayProxyTest {
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(429, rejected.statusCode());
             assertEquals(2, forwarded.get());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
+    void reportsUpstreamUnavailableWhenConnectionFails() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("ok")))
+                .bindNow();
+        int deadPort = backend.port();
+        backend.disposeNow();
+
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("users", "/users", URI.create("http://localhost:" + deadPort))),
+                Duration.ofSeconds(3)).start(0);
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            var response = client.send(HttpRequest.newBuilder(URI.create("http://localhost:" + gateway.port() + "/users/1"))
+                    .GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(502, response.statusCode());
+            assertTrue(response.body().contains("Upstream unavailable"));
+        } finally {
+            gateway.disposeNow();
+        }
+    }
+
+    @Test
+    void filtersHopByHopHeaders() throws Exception {
+        AtomicBoolean receivedHopHeader = new AtomicBoolean(false);
+        AtomicBoolean receivedCustomHeader = new AtomicBoolean(false);
+
+        DisposableServer backend = HttpServer.create().port(0).handle((request, response) -> {
+            if (request.requestHeaders().contains("X-Hop-Header")
+                    || request.requestHeaders().contains("Keep-Alive")
+                    || request.requestHeaders().contains("Proxy-Connection")) {
+                receivedHopHeader.set(true);
+            }
+            if ("custom-value".equals(request.requestHeaders().get("X-Custom-Header"))) {
+                receivedCustomHeader.set(true);
+            }
+            return response.header("X-Response-Custom", "backend-value")
+                    .header("Keep-Alive", "timeout=5")
+                    .header("Proxy-Authenticate", "Basic")
+                    .sendString(Mono.just("filtered"));
+        }).bindNow();
+
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("users", "/users", URI.create("http://localhost:" + backend.port()))),
+                Duration.ofSeconds(3)).start(0);
+        try {
+            var testClient = reactor.netty.http.client.HttpClient.create();
+            String responseBody = testClient.headers(h -> h
+                            .add("X-Custom-Header", "custom-value")
+                            .add("Keep-Alive", "timeout=10")
+                            .add("Proxy-Connection", "keep-alive")
+                            .add("Connection", "close, X-Hop-Header")
+                            .add("X-Hop-Header", "should-be-stripped"))
+                    .get()
+                    .uri("http://localhost:" + gateway.port() + "/users/test")
+                    .responseSingle((resp, byteBufMono) -> {
+                        assertEquals(200, resp.status().code());
+                        assertEquals("backend-value", resp.responseHeaders().get("X-Response-Custom"));
+                        assertFalse(resp.responseHeaders().contains("Keep-Alive"), "Keep-Alive should not reach client");
+                        assertFalse(resp.responseHeaders().contains("Proxy-Authenticate"), "Proxy-Authenticate should not reach client");
+                        return byteBufMono.asString();
+                    })
+                    .block(Duration.ofSeconds(3));
+
+            assertEquals("filtered", responseBody);
+            assertTrue(receivedCustomHeader.get(), "Custom header should reach backend");
+            assertFalse(receivedHopHeader.get(), "Hop-by-hop headers should not reach backend");
         } finally {
             gateway.disposeNow();
             backend.disposeNow();
