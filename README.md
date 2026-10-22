@@ -93,4 +93,20 @@ Invoke-WebRequest -UseBasicParsing http://localhost:8080/_gateway/version
 
 API: `POST /admin/config/versions` accepts `expectedVersion`, `responseTimeoutSeconds`, and a complete `routes` array. `POST /admin/config/rollback/{targetVersion}` accepts `expectedVersion`; rollback creates a new version. A stale expected version returns 409, invalid routes return 400, and missing or invalid bearer tokens return 401. Configurations are immutable once published. Upstream URLs, route prefixes, rate policies, and response timeout can all be changed. The control plane is queried only by the background poller, never for each proxied request.
 
+## M6: observability and reliability
+
+Compose bundles Prometheus (`http://localhost:9091`) and Grafana (`http://localhost:3000`, user/pass: `admin`/`admin`) with a pre-provisioned dashboard:
+
+- **Metrics endpoint:** `GET /_gateway/metrics` exports Prometheus text format covering `gateway_requests_total`, `gateway_request_duration_seconds` (p50/p95/p99 quantiles), `gateway_rate_limited_total`, `gateway_upstream_failures_total`, `gateway_redis_failures_total` (after a Redis request fails), and `gateway_in_flight_requests`.
+- **Health endpoint:** `GET /_gateway/health` reports status `UP` (200) or `SERVICE_UNAVAILABLE` (503) based on upstream availability.
+- **Structured access logging:** Emits sanitized JSON lines per request with method, path, route, status, duration, upstream, rate limit outcome, and client IP without leaking sensitive authorization credentials.
+- **Graceful shutdown:** On SIGTERM/SIGINT, the gateway rejects new requests with 503, waits up to 10 seconds for requests already running, then closes the server and Redis client.
+
+Verify observability and metrics collection:
+
+```powershell
+docker compose up --build -d
+.\scripts\verify-observability.ps1
+```
+
 The working PRD is kept locally in `docs/PRD.md` and excluded from the public repository. This is an experimental engineering project and has not been hardened as a production security boundary. A license for this gateway repo still needs to be selected before publishing it as open source.

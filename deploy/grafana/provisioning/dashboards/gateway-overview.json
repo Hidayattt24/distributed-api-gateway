@@ -1,0 +1,103 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "Request Rate (RPS by Route & Status)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum by (route, status) (rate(gateway_requests_total[1m]))",
+          "legendFormat": "{{route}} - {{status}}"
+        }
+      ]
+    },
+    {
+      "title": "Request Duration Percentiles (Seconds)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "gateway_request_duration_seconds{quantile=~\"0.5|0.95|0.99\"}",
+          "legendFormat": "{{route}} p{{quantile}}"
+        }
+      ]
+    },
+    {
+      "title": "Rate Limited Requests (429 Drops / sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (route, key_type) (rate(gateway_rate_limited_total[1m]))",
+          "legendFormat": "{{route}} ({{key_type}})"
+        }
+      ]
+    },
+    {
+      "title": "Upstream Failures (502 / 504 per sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum by (route, reason) (rate(gateway_upstream_failures_total[1m]))",
+          "legendFormat": "{{route}} - {{reason}}"
+        }
+      ]
+    },
+    {
+      "title": "In-Flight Requests",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 4, "x": 16, "y": 8 },
+      "targets": [
+        {
+          "expr": "gateway_in_flight_requests",
+          "legendFormat": "In Flight"
+        }
+      ]
+    },
+    {
+      "title": "Config Version",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 4, "x": 20, "y": 8 },
+      "targets": [
+        {
+          "expr": "gateway_config_version",
+          "legendFormat": "Version"
+        }
+      ]
+    },
+    {
+      "title": "Redis Failures (per sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (failure_mode, reason) (rate(gateway_redis_failures_total[1m]))",
+          "legendFormat": "{{failure_mode}} - {{reason}}"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["gateway", "observability"],
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Distributed API Gateway Overview",
+  "uid": "gateway-overview",
+  "version": 1
+}
