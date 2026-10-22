@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Mono;
@@ -26,12 +27,13 @@ public final class GatewayProxy {
             "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
             "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade", "host");
 
-    private final List<GatewayRoute> routes;
-    private final Map<String, RateLimitPolicy> rateLimitPolicies;
+    private final AtomicReference<Snapshot> active;
     private final RateLimiter rateLimiter;
     private final LoadBalancer loadBalancer;
-    private final ApiKeyVerifier apiKeyVerifier;
-    private final HttpClient client;
+
+    private record Snapshot(long version, List<GatewayRoute> routes,
+            Map<String, RateLimitPolicy> policies, ApiKeyVerifier apiKeyVerifier, HttpClient client) {
+    }
 
     public GatewayProxy(List<GatewayRoute> routes, Duration responseTimeout) {
         this(routes, responseTimeout, Map.of(), new LocalTokenBucketRateLimiter());
@@ -51,12 +53,32 @@ public final class GatewayProxy {
     public GatewayProxy(List<GatewayRoute> routes, Duration responseTimeout,
             Map<String, RateLimitPolicy> rateLimitPolicies, RateLimiter rateLimiter,
             LoadBalancer loadBalancer, ApiKeyVerifier apiKeyVerifier) {
-        this.routes = List.copyOf(routes);
-        this.rateLimitPolicies = Map.copyOf(rateLimitPolicies);
         this.rateLimiter = Objects.requireNonNull(rateLimiter);
         this.loadBalancer = Objects.requireNonNull(loadBalancer);
-        this.apiKeyVerifier = Objects.requireNonNull(apiKeyVerifier);
-        this.client = HttpClient.create().responseTimeout(responseTimeout);
+        this.active = new AtomicReference<>(new Snapshot(0, List.copyOf(routes), Map.copyOf(rateLimitPolicies),
+                Objects.requireNonNull(apiKeyVerifier), HttpClient.create().responseTimeout(responseTimeout)));
+    }
+
+    public GatewayProxy(GatewayConfig config, RateLimiter rateLimiter) {
+        this(config.compiledRoutes(), Duration.ofSeconds(config.responseTimeoutSeconds()),
+                config.compiledPolicies(), rateLimiter, new LoadBalancer(), config.apiKeyVerifier());
+        install(config);
+    }
+
+    /** All derived objects are built before the active pointer changes. */
+    public synchronized void install(GatewayConfig config) {
+        Objects.requireNonNull(config);
+        if (config.version() <= active.get().version()) {
+            throw new IllegalArgumentException("Configuration version must increase");
+        }
+        Snapshot next = new Snapshot(config.version(), config.compiledRoutes(), config.compiledPolicies(),
+                config.apiKeyVerifier(), HttpClient.create()
+                        .responseTimeout(Duration.ofSeconds(config.responseTimeoutSeconds())));
+        active.set(next);
+    }
+
+    public long activeVersion() {
+        return active.get().version();
     }
 
     public DisposableServer start(int port) {
@@ -64,19 +86,25 @@ public final class GatewayProxy {
     }
 
     private Publisher<Void> handle(HttpServerRequest request, HttpServerResponse response) {
-        GatewayRoute route = routes.stream().filter(candidate -> candidate.matches(request.uri())).findFirst().orElse(null);
+        if ("/_gateway/version".equals(request.uri())) {
+            return response.header("Content-Type", "text/plain")
+                    .sendString(Mono.just(Long.toString(activeVersion()))).then();
+        }
+        Snapshot snapshot = active.get();
+        GatewayRoute route = snapshot.routes().stream()
+                .filter(candidate -> candidate.matches(request.uri())).findFirst().orElse(null);
         if (route == null) {
             return response.status(HttpResponseStatus.NOT_FOUND)
                     .sendString(Mono.just("No matching route"))
                     .then();
         }
 
-        RateLimitPolicy policy = rateLimitPolicies.get(route.id());
+        RateLimitPolicy policy = snapshot.policies().get(route.id());
         if (policy == null) {
-            return forward(request, response, route, null);
+            return forward(request, response, route, null, snapshot);
         }
 
-        var rateLimitKey = RateLimitKeyResolver.resolveKey(request, route, policy, apiKeyVerifier);
+        var rateLimitKey = RateLimitKeyResolver.resolveKey(request, route, policy, snapshot.apiKeyVerifier());
         if (rateLimitKey.isEmpty()) {
             return response.status(HttpResponseStatus.UNAUTHORIZED)
                     .sendString(Mono.just("Invalid API key"))
@@ -85,7 +113,7 @@ public final class GatewayProxy {
         return rateLimiter.evaluate(rateLimitKey.orElseThrow(), policy)
                 .flatMap(decision -> {
                     if (decision.allowed()) {
-                        return forward(request, response, route, decision);
+                        return forward(request, response, route, decision, snapshot);
                     }
                     response.status(HttpResponseStatus.TOO_MANY_REQUESTS)
                             .header("X-RateLimit-Limit", String.valueOf(decision.limit()))
@@ -95,14 +123,15 @@ public final class GatewayProxy {
                 });
     }
 
-    private Mono<Void> forward(HttpServerRequest request, HttpServerResponse response, GatewayRoute route, RateLimitDecision decision) {
+    private Mono<Void> forward(HttpServerRequest request, HttpServerResponse response, GatewayRoute route,
+            RateLimitDecision decision, Snapshot snapshot) {
         URI upstream = loadBalancer.select(route);
         if (upstream == null) {
             response.status(HttpResponseStatus.BAD_GATEWAY);
             return response.sendString(Mono.just("All upstreams unavailable")).then();
         }
         String target = upstream.toString().replaceAll("/+$", "") + request.uri();
-        return client.headers(headers -> copyHeaders(request.requestHeaders(), headers))
+        return snapshot.client().headers(headers -> copyHeaders(request.requestHeaders(), headers))
                 .request(request.method())
                 .uri(target)
                 .send((outboundRequest, outbound) -> outbound.send(request.receive().retain()))
