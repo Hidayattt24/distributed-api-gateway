@@ -1,6 +1,7 @@
 package dev.distributedgateway.ratelimit;
 
 import dev.distributedgateway.core.LocalTokenBucketRateLimiter;
+import dev.distributedgateway.core.GatewayMetrics;
 import dev.distributedgateway.core.RateLimitDecision;
 import dev.distributedgateway.core.RateLimitPolicy;
 import dev.distributedgateway.core.RateLimiter;
@@ -12,6 +13,7 @@ import io.lettuce.core.api.reactive.RedisReactiveCommands;
 import java.util.List;
 import java.util.Objects;
 import java.time.Duration;
+import java.util.concurrent.TimeoutException;
 import reactor.core.publisher.Mono;
 
 public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
@@ -62,6 +64,11 @@ public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
     private final RedisReactiveCommands<String, String> reactive;
     private final RateLimiter localFallback;
     private final Duration operationTimeout;
+    private volatile GatewayMetrics metrics;
+
+    public void setMetrics(GatewayMetrics metrics) {
+        this.metrics = Objects.requireNonNull(metrics, "metrics required");
+    }
 
     public RedisRateLimiter(String redisUri) {
         this(createClient(redisUri));
@@ -129,6 +136,11 @@ public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
                 })
                 .timeout(operationTimeout)
                 .onErrorResume(error -> {
+                    GatewayMetrics currentMetrics = metrics;
+                    if (currentMetrics != null) {
+                        currentMetrics.recordRedisFailure(policy.failureMode().name(),
+                                error instanceof TimeoutException ? "timeout" : "unavailable");
+                    }
                     if (policy.failureMode() == RateLimitPolicy.RedisFailureMode.FAIL_OPEN) {
                         return Mono.just(RateLimitDecision.allowed(policy.capacity(), policy.capacity()));
                     }

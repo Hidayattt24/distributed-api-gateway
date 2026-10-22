@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import dev.distributedgateway.core.LocalTokenBucketRateLimiter;
+import dev.distributedgateway.core.GatewayMetrics;
 import dev.distributedgateway.core.RateLimitDecision;
 import dev.distributedgateway.core.RateLimitPolicy;
 import io.lettuce.core.RedisException;
@@ -28,9 +29,14 @@ class RedisRateLimiterTest {
                 (proxy, method, args) -> Flux.never());
         RedisRateLimiter limiter = new RedisRateLimiter(hungRedis,
                 new LocalTokenBucketRateLimiter(() -> 0L), Duration.ofMillis(100));
+        GatewayMetrics metrics = new GatewayMetrics();
+        limiter.setMetrics(metrics);
         RateLimitPolicy policy = new RateLimitPolicy(1, 0.1);
         assertTrue(limiter.evaluate("route", policy).block(Duration.ofSeconds(2)).allowed());
         assertFalse(limiter.evaluate("route", policy).block(Duration.ofSeconds(2)).allowed());
+        assertTrue(metrics.scrape().contains("gateway_redis_failures_total"));
+        assertTrue(metrics.scrape().contains("reason=\"timeout\""));
+        assertTrue(metrics.scrape().contains("failure_mode=\"LOCAL_FALLBACK\""));
     }
 
     @Test
