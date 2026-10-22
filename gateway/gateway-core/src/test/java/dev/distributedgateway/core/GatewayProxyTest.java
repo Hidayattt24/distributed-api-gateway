@@ -384,6 +384,70 @@ class GatewayProxyTest {
         }
     }
 
+    @Test
+    void failedUpstreamRecoversAfterCooldown() throws Exception {
+        DisposableServer primary = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("primary"))).bindNow();
+        int primaryPort = primary.port();
+        DisposableServer secondary = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("secondary"))).bindNow();
+        GatewayRoute route = new GatewayRoute("pool", "/pool", List.of(
+                URI.create("http://localhost:" + primaryPort),
+                URI.create("http://localhost:" + secondary.port())));
+        LoadBalancer loadBalancer = new LoadBalancer(Duration.ofMillis(250), System::nanoTime);
+        DisposableServer gateway = new GatewayProxy(List.of(route), Duration.ofSeconds(2),
+                Map.of(), new LocalTokenBucketRateLimiter(), loadBalancer).start(0);
+        DisposableServer recovered = null;
+        try {
+            primary.disposeNow();
+            var client = java.net.http.HttpClient.newHttpClient();
+            String url = "http://localhost:" + gateway.port() + "/pool";
+            var failed = client.send(HttpRequest.newBuilder(URI.create(url)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(502, failed.statusCode());
+            var healthy = client.send(HttpRequest.newBuilder(URI.create(url)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals("secondary", healthy.body());
+            recovered = HttpServer.create().port(primaryPort)
+                    .handle((request, response) -> response.sendString(Mono.just("recovered"))).bindNow();
+            Thread.sleep(300);
+            boolean reachedRecovered = false;
+            for (int i = 0; i < 4; i++) {
+                var result = client.send(HttpRequest.newBuilder(URI.create(url)).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                reachedRecovered |= "recovered".equals(result.body());
+            }
+            assertTrue(reachedRecovered);
+        } finally {
+            gateway.disposeNow();
+            if (recovered != null) {
+                recovered.disposeNow();
+            }
+            secondary.disposeNow();
+        }
+    }
+
+    @Test
+    void forwardsLargeRequestAndResponseBody() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.status(201)
+                        .send(request.receive().retain())).bindNow();
+        DisposableServer gateway = new GatewayProxy(List.of(new GatewayRoute("upload", "/upload",
+                URI.create("http://localhost:" + backend.port()))), Duration.ofSeconds(5)).start(0);
+        try {
+            String body = "x".repeat(1_048_576);
+            var result = java.net.http.HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create("http://localhost:" + gateway.port() + "/upload?source=test"))
+                            .POST(HttpRequest.BodyPublishers.ofString(body)).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(201, result.statusCode());
+            assertEquals(body, result.body());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
     private static String hash(String value) throws Exception {
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
                 .digest(value.getBytes(StandardCharsets.UTF_8)));

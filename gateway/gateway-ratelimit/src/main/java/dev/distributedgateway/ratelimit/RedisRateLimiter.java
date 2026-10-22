@@ -11,7 +11,7 @@ import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.reactive.RedisReactiveCommands;
 import java.util.List;
 import java.util.Objects;
-import java.util.function.DoubleSupplier;
+import java.time.Duration;
 import reactor.core.publisher.Mono;
 
 public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
@@ -19,8 +19,9 @@ public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
             local key = KEYS[1]
             local capacity = tonumber(ARGV[1])
             local refill_rate = tonumber(ARGV[2])
-            local now = tonumber(ARGV[3])
-            local requested = tonumber(ARGV[4])
+            local clock = redis.call('TIME')
+            local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
+            local requested = tonumber(ARGV[3])
 
             local data = redis.call('HMGET', key, 'tokens', 'last_updated')
             local tokens = tonumber(data[1])
@@ -60,30 +61,46 @@ public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
     private final StatefulRedisConnection<String, String> connection;
     private final RedisReactiveCommands<String, String> reactive;
     private final RateLimiter localFallback;
-    private final DoubleSupplier nowSupplier;
+    private final Duration operationTimeout;
 
     public RedisRateLimiter(String redisUri) {
-        this(RedisClient.create(RedisURI.create(redisUri)));
+        this(createClient(redisUri));
+    }
+
+    private static RedisClient createClient(String redisUri) {
+        RedisURI uri = RedisURI.create(redisUri);
+        uri.setTimeout(Duration.ofSeconds(3));
+        return RedisClient.create(uri);
     }
 
     public RedisRateLimiter(RedisClient client) {
-        this(client, new LocalTokenBucketRateLimiter(), () -> System.currentTimeMillis() / 1000.0);
+        this(client, new LocalTokenBucketRateLimiter(), Duration.ofSeconds(2));
     }
 
-    public RedisRateLimiter(RedisClient client, RateLimiter localFallback, DoubleSupplier nowSupplier) {
+    public RedisRateLimiter(RedisClient client, RateLimiter localFallback, Duration operationTimeout) {
         this.client = Objects.requireNonNull(client, "client required");
-        this.connection = client.connect();
+        try {
+            this.connection = client.connect();
+        } catch (RuntimeException error) {
+            client.shutdown();
+            throw new IllegalStateException("Redis unavailable at gateway startup; gateway did not start", error);
+        }
         this.reactive = this.connection.reactive();
         this.localFallback = Objects.requireNonNull(localFallback, "localFallback required");
-        this.nowSupplier = Objects.requireNonNull(nowSupplier, "nowSupplier required");
+        this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout required");
     }
 
-    public RedisRateLimiter(RedisReactiveCommands<String, String> reactive, RateLimiter localFallback, DoubleSupplier nowSupplier) {
+    public RedisRateLimiter(RedisReactiveCommands<String, String> reactive, RateLimiter localFallback) {
+        this(reactive, localFallback, Duration.ofSeconds(2));
+    }
+
+    public RedisRateLimiter(RedisReactiveCommands<String, String> reactive, RateLimiter localFallback,
+            Duration operationTimeout) {
         this.client = null;
         this.connection = null;
         this.reactive = Objects.requireNonNull(reactive, "reactive required");
         this.localFallback = Objects.requireNonNull(localFallback, "localFallback required");
-        this.nowSupplier = Objects.requireNonNull(nowSupplier, "nowSupplier required");
+        this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout required");
     }
 
     @Override
@@ -96,7 +113,6 @@ public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
         String[] args = new String[]{
                 String.valueOf(policy.capacity()),
                 String.valueOf(policy.refillTokensPerSecond()),
-                String.valueOf(nowSupplier.getAsDouble()),
                 "1"
         };
 
@@ -111,6 +127,7 @@ public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
                             ? RateLimitDecision.allowed(limit, remaining)
                             : RateLimitDecision.rejected(limit, retryAfter);
                 })
+                .timeout(operationTimeout)
                 .onErrorResume(error -> {
                     if (policy.failureMode() == RateLimitPolicy.RedisFailureMode.FAIL_OPEN) {
                         return Mono.just(RateLimitDecision.allowed(policy.capacity(), policy.capacity()));

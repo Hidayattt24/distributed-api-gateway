@@ -3,6 +3,7 @@ package dev.distributedgateway.ratelimit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import dev.distributedgateway.core.LocalTokenBucketRateLimiter;
 import dev.distributedgateway.core.RateLimitDecision;
@@ -10,12 +11,39 @@ import dev.distributedgateway.core.RateLimitPolicy;
 import io.lettuce.core.RedisException;
 import io.lettuce.core.api.reactive.RedisReactiveCommands;
 import java.lang.reflect.Proxy;
+import java.net.ServerSocket;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 
 class RedisRateLimiterTest {
+    @Test
+    void fallsBackWhenRedisCommandNeverCompletes() {
+        @SuppressWarnings("unchecked")
+        RedisReactiveCommands<String, String> hungRedis = (RedisReactiveCommands<String, String>) Proxy.newProxyInstance(
+                RedisReactiveCommands.class.getClassLoader(),
+                new Class<?>[]{RedisReactiveCommands.class},
+                (proxy, method, args) -> Flux.never());
+        RedisRateLimiter limiter = new RedisRateLimiter(hungRedis,
+                new LocalTokenBucketRateLimiter(() -> 0L), Duration.ofMillis(100));
+        RateLimitPolicy policy = new RateLimitPolicy(1, 0.1);
+        assertTrue(limiter.evaluate("route", policy).block(Duration.ofSeconds(2)).allowed());
+        assertFalse(limiter.evaluate("route", policy).block(Duration.ofSeconds(2)).allowed());
+    }
+
+    @Test
+    void failsClearlyWhenRedisIsUnavailableAtStartup() throws Exception {
+        int unusedPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            unusedPort = socket.getLocalPort();
+        }
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> new RedisRateLimiter("redis://127.0.0.1:" + unusedPort));
+        assertTrue(error.getMessage().contains("gateway did not start"));
+    }
+
     @Test
     void parsesSuccessfulLuaScriptOutput() {
         @SuppressWarnings("unchecked")
@@ -29,7 +57,7 @@ class RedisRateLimiterTest {
                     return null;
                 });
 
-        RedisRateLimiter limiter = new RedisRateLimiter(mockReactive, new LocalTokenBucketRateLimiter(), () -> 100.0);
+        RedisRateLimiter limiter = new RedisRateLimiter(mockReactive, new LocalTokenBucketRateLimiter());
         RateLimitPolicy policy = new RateLimitPolicy(10, 5.0);
 
         RateLimitDecision decision = limiter.evaluate("route1", policy).block();
@@ -58,7 +86,7 @@ class RedisRateLimiterTest {
         RedisRateLimiter limiter = new RedisRateLimiter(brokenRedis, (key, policy) -> {
             localFallbackCalls.incrementAndGet();
             return localLimiter.evaluate(key, policy);
-        }, () -> 100.0);
+        });
 
         RateLimitPolicy policy = new RateLimitPolicy(2, 1.0, RateLimitPolicy.KeyType.ROUTE,
                 RateLimitPolicy.RedisFailureMode.LOCAL_FALLBACK);
@@ -84,7 +112,7 @@ class RedisRateLimiterTest {
                 new Class<?>[]{RedisReactiveCommands.class},
                 (proxy, method, args) -> Flux.error(new RedisException("Redis cluster timeout")));
 
-        RedisRateLimiter limiter = new RedisRateLimiter(brokenRedis, new LocalTokenBucketRateLimiter(), () -> 100.0);
+        RedisRateLimiter limiter = new RedisRateLimiter(brokenRedis, new LocalTokenBucketRateLimiter());
         RateLimitPolicy policy = new RateLimitPolicy(5, 1.0, RateLimitPolicy.KeyType.ROUTE,
                 RateLimitPolicy.RedisFailureMode.FAIL_OPEN);
 
