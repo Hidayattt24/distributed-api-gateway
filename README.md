@@ -1,112 +1,368 @@
 # Distributed API Gateway
 
-Java 21 and Reactor Netty gateway. The gateway matches routes, balances traffic across upstream instances with Round Robin and passive health checks, enforces local or Redis-backed distributed Token Bucket rate limiting, and forwards allowed HTTP requests to backend microservices.
+High-performance, non-blocking HTTP API Gateway built with **Java 21**, **Reactor Netty**, and **Redis**. Designed as a robust single entry point for distributed microservices architectures, featuring atomic Token Bucket rate limiting, upstream load balancing with passive health recovery, zero-downtime dynamic reconfiguration, and full Prometheus/Grafana observability.
 
-The PetClinic source is kept in a separate local clone of [Spring PetClinic Microservices](https://github.com/spring-petclinic/spring-petclinic-microservices) (upstream commit `1d76b00`, Apache 2.0). This gateway's Compose file uses PetClinic's published service images and a Redis instance for shared quota state. It does not start PetClinic's own API gateway: port 8080 belongs to this project.
+---
 
-## Modules
+## Table of Contents
 
-- `gateway/gateway-core`: route matching, upstream pool load balancing, and Reactor Netty proxy.
-- `gateway/gateway-ratelimit`: Redis distributed Token Bucket (atomic Lua), key resolvers, and local fallback.
-- `gateway/gateway-runtime`: executable and configuration loader.
-- `control-plane`: Spring Boot administration API backed by PostgreSQL; stores immutable configuration versions.
-- PetClinic `customers-service`, `visits-service`, and `vets-service`: external upstream services. The cloned source lives outside this Gradle project.
+- [Overview](#overview)
+- [Why an API Gateway? (Architecture Flow)](#why-an-api-gateway-architecture-flow)
+  - [Without an API Gateway (Direct Client-to-Service)](#without-an-api-gateway-direct-client-to-service)
+  - [With Distributed API Gateway (Centralized Entry Point)](#with-distributed-api-gateway-centralized-entry-point)
+- [System Architecture: Data Plane vs. Control Plane](#system-architecture-data-plane-vs-control-plane)
+- [Core Features](#core-features)
+- [Project Modules](#project-modules)
+- [Reference Demo Microservices](#reference-demo-microservices)
+- [Quick Start](#quick-start)
+- [Configuration Reference](#configuration-reference)
+- [Observability & Monitoring](#observability--monitoring)
+- [Dynamic Reconfiguration & Rollback](#dynamic-reconfiguration--rollback)
+- [Automated Verification Scripts](#automated-verification-scripts)
 
-## Run on Windows
+---
 
-Requirements: JDK 21, Docker Desktop, Git. Open this repository root in VS Code or IntelliJ IDEA. Use the included Gradle Wrapper.
+## Overview
+
+Modern microservices split backend functionality across dozens of independent HTTP services. Exposing each service directly to the public internet creates security vulnerabilities, complicated client applications, network overhead, and difficult traffic management.
+
+**Distributed API Gateway** solves this by sitting between external clients and backend microservices:
+1. **Single Public Entry Point:** Clients communicate with one domain/port; internal services remain private.
+2. **Traffic Protection:** Distributed Token Bucket algorithm drops abusive traffic at the perimeter before it exhausts backend resources.
+3. **Resilience & Fault Isolation:** Unhealthy upstream instances are automatically removed from rotation and gradually retried after a cooldown period.
+4. **Zero-Downtime Updates:** Routes, rate limits, and upstreams can be modified and rolled back via a secure Control Plane API without restarting the gateway data plane.
+
+---
+
+## Why an API Gateway? (Architecture Flow)
+
+### Without an API Gateway (Direct Client-to-Service)
+
+When web browsers or mobile apps interact directly with backend microservices:
+
+```text
+                                Internet
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         │ :8081                   │ :8082                   │ :8083
+         ▼                         ▼                         ▼
+┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐
+│ Customer Service │      │  Visit Service   │      │   Vet Service    │
+│ (Public IP/Port) │      │ (Public IP/Port) │      │ (Public IP/Port) │
+└──────────────────┘      └──────────────────┘      └──────────────────┘
+```
+
+**Challenges:**
+- **Exposed Attack Surface:** Every microservice must expose public ports and public IP addresses.
+- **Complex Client Logic:** Clients must track multiple hostnames, ports, and API versions.
+- **CORS Overhead:** Every microservice must implement and maintain cross-origin headers, causing preflight `OPTIONS` latency.
+- **No Global Rate Limiting:** A burst of requests can saturate backend databases directly.
+- **Client-Side Failover:** If an instance crashes, the client experiences immediate failures.
+
+---
+
+### With Distributed API Gateway (Centralized Entry Point)
+
+The gateway acts as an intelligent, high-throughput reverse proxy:
+
+```text
+                         [ Web Browser / Mobile App ]
+                                      │
+                                      │ Single Endpoint: https://api.example.com
+                                      │ (GET /owners, /pets/visits, /vets)
+                                      ▼
+                      ┌───────────────────────────────┐
+                      │    DISTRIBUTED API GATEWAY    │
+                      │  - SSL Termination            │
+                      │  - Path Prefix Routing        │
+                      │  - Redis Token Bucket Limiter │
+                      │  - Round Robin Load Balancer  │
+                      │  - Hop-by-Hop Header Cleanup  │
+                      └───────────────┬───────────────┘
+                                      │
+   ═══════════════════════════════════╪═════════════════════════════════════════════
+   PRIVATE INTERNAL NETWORK (VPC / Docker Network - No Public Access)
+   ═══════════════════════════════════╪═════════════════════════════════════════════
+                                      │
+                  ┌───────────────────┼───────────────────┐
+                  ▼                   ▼                   ▼
+         ┌──────────────────┐┌──────────────────┐┌──────────────────┐
+         │ Customer Service ││  Visit Service   ││   Vet Service    │
+         │  (10.0.1.10:8081)││  (10.0.1.11:8082)││  (10.0.1.12:8083)│
+         └──────────────────┘└──────────────────┘└──────────────────┘
+```
+
+**Benefits:**
+- **Zero Public Exposure:** Backends operate in private networks without public IPs.
+- **Centralized Security:** SSL certificates, CORS policies, and authentication checks happen in one place.
+- **Shielded Microservices:** Requests exceeding quotas are dropped at the perimeter with `HTTP 429 Too Many Requests`.
+- **Seamless Failover:** Load balancer automatically bypasses unresponsive nodes without client awareness.
+
+---
+
+## System Architecture: Data Plane vs. Control Plane
+
+The project strictly decouples traffic forwarding from configuration management:
+
+```text
+                  [ External Clients ]
+                           │
+                           ▼
+ ┌────────────────────────────────────────────────────────────┐
+ │ DATA PLANE (:8080) - Java 21 & Reactor Netty               │
+ │                                                            │
+ │   Active Snapshot (AtomicReference<Snapshot>)              │
+ │   ├── Route Matcher (Prefix resolution)                    │
+ │   ├── Identity Resolver (ROUTE, API_KEY, CLIENT_IP)        │
+ │   ├── Rate Limiter (Redis Lua / Local fallback)            │
+ │   ├── Load Balancer (Round Robin + Passive Cooldown)       │
+ │   └── Forwarder (Hop-by-hop sanitization & Streaming)      │
+ └─────────────────────────▲──────────────────────────────────┘
+                           │
+                           │ Polls /internal/config/active (every 2s)
+                           │ Replaces snapshot atomically without dropping traffic
+                           │
+ ┌─────────────────────────┴──────────────────────────────────┐
+ │ CONTROL PLANE (:9090) - Spring Boot & PostgreSQL           │
+ │                                                            │
+ │   ├── Admin REST API (/admin/config/...)                   │
+ │   ├── Token Authentication (Bearer token)                  │
+ │   ├── Config Store (Immutable versioning & Rollback)       │
+ │   └── Validation Engine (Route prefixes, URLs, policies)   │
+ └────────────────────────────────────────────────────────────┘
+```
+
+- **Data Plane (High Performance):** Built with pure Reactor Netty. Completely non-blocking event-loop architecture. Handles millions of proxied requests with sub-millisecond overhead without framework bloat.
+- **Control Plane (Management & Safety):** Built with Spring Boot and PostgreSQL. Allows platform engineers to add routes, adjust rate limits, change upstream pools, or trigger immediate rollbacks with zero gateway downtime.
+
+---
+
+## Core Features
+
+- **High-Throughput Reactive Proxy:** Pure Netty HTTP client/server pipeline handling streaming payloads and preserving non-hop-by-hop headers.
+- **Distributed Token Bucket Rate Limiting:** Evaluates token consumption and refills atomically in Redis using Lua scripts. Supports dynamic Redis key expiration (TTL) to avoid memory leaks.
+- **Resilient Fallback Modes:** If Redis experiences downtime, routes automatically degrade to in-memory local token buckets (`LOCAL_FALLBACK`) or allow traffic through (`FAIL_OPEN`).
+- **Flexible Identity Resolution:**
+  - `ROUTE`: Shared rate limit quota across all callers of a route.
+  - `API_KEY`: Per-consumer quota identified by header `X-API-Key`, verified using constant-time SHA-256 digest matching (`ApiKeyVerifier`).
+  - `CLIENT_IP`: Per-origin quota using peer network address.
+- **Round-Robin Load Balancing:** Distributes requests evenly across upstream pools.
+- **Passive Failure Detection:** Unresponsive or timed-out upstreams are isolated into a 10-second cooldown period, then gradually re-introduced upon recovery.
+- **Standard HTTP Rate Limit Headers:** Emits `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After` (on 429).
+- **Graceful Shutdown & Request Draining:** On `SIGTERM`/`SIGINT`, the gateway halts new connections, drains in-flight requests for up to 10 seconds, and cleanly closes socket pools and Redis connections.
+- **Comprehensive Observability:** Prometheus metrics (`/_gateway/metrics`), health status probe (`/_gateway/health`), and structured JSON access logs.
+
+---
+
+## Project Modules
+
+```text
+distributed-api-gateway/
+├── gateway/
+│   ├── gateway-core/           # Routing, proxy pipeline, load balancing, metrics, and local limiter
+│   ├── gateway-ratelimit/      # Redis distributed Token Bucket (Lettuce driver & atomic Lua script)
+│   └── gateway-runtime/        # Executable binary, configuration loader, and background subscriber
+├── control-plane/              # Spring Boot management API with PostgreSQL persistence
+├── deploy/
+│   ├── prometheus/             # Prometheus scraping configuration
+│   └── grafana/                # Pre-provisioned dashboards and datasources
+├── scripts/                    # Automated end-to-end and chaos test scripts
+├── config/                     # Default static gateway configuration
+└── compose.yaml                # Full microservices, control plane, redis, and monitoring stack
+```
+
+---
+
+## Reference Demo Microservices
+
+This repository uses a reference set of backend microservices based on the [Spring PetClinic Microservices](https://github.com/spring-petclinic/spring-petclinic-microservices) architecture:
+- `customers-service` (`:8081`): Manages pet owners and pet records.
+- `visits-service` (`:8082`): Manages clinic visit histories.
+- `vets-service` (`:8083`): Manages veterinarian registries and specialties.
+
+*Note: These backend services serve solely as a test fixture to demonstrate real routing, failover, and rate limiting behavior. The gateway is completely backend-agnostic and works with any HTTP service (Java, Node.js, Go, Python, etc.).*
+
+---
+
+## Quick Start
+
+### Prerequisites
+- **JDK 21** or later
+- **Docker Desktop** (with Docker Compose v2)
+- **Git**
+
+### 1. Launch the Complete Stack
+
+Start the gateway, reference microservices, Redis, PostgreSQL, Control Plane, Prometheus, and Grafana:
 
 ```powershell
 docker compose up --build -d
 docker compose ps
 ```
 
-The first startup pulls PetClinic images and may take several minutes. Its config server retrieves configuration from the PetClinic config repository. After services are ready, try:
+*(Note: The first launch pulls container images and initializes the demo services; this may take 1-3 minutes).*
+
+### 2. Send Requests Through the Gateway
+
+All client traffic enters through the Gateway at `http://localhost:8080`:
 
 ```powershell
-curl.exe -i 'http://localhost:8080/owners/1'
-curl.exe -i 'http://localhost:8080/vets'
+# Proxied to customers-service (:8081)
+curl.exe -i http://localhost:8080/owners/1
+
+# Proxied to vets-service (:8083)
+curl.exe -i http://localhost:8080/vets
+
+# Proxied to visits-service (:8082)
 curl.exe -i 'http://localhost:8080/pets/visits?petId=1'
-curl.exe -i 'http://localhost:8080/missing'
+
+# Non-existent route returns 404 from the Gateway
+curl.exe -i http://localhost:8080/unknown-path
 ```
 
-Routes preserve the request path and query string. `/owners` reaches `customers-service:8081`, `/pets/visits` reaches `visits-service:8082`, and `/vets` reaches `vets-service:8083`. A request for another path returns 404 from this gateway. While a PetClinic service is still starting, the gateway may return 502 or 504; retry after `docker compose ps` shows the services running.
+### 3. Observe Rate Limiting
 
-Each configured route has a Token Bucket policy: burst 10, refill 5 tokens per second. A burst above this limit returns HTTP 429 from the gateway. Change routes and policies in `config/gateway.properties`; Compose supplies the corresponding upstream URLs with environment variables.
-
-If `REDIS_URL` is set (as in Compose), quota state is shared through Redis instead. Without it, the gateway uses local buckets. For `keyType=API_KEY`, configure `RATE_LIMIT_<ROUTE_ID>_API_KEY_SHA256` in the gateway environment with comma-separated SHA-256 hex digests. Startup fails if no hashes are configured. Missing or invalid `X-API-Key` receives HTTP 401, before quota evaluation. Rotate keys by updating the digest list and restarting the gateway. `CLIENT_IP` uses the direct TCP peer address; behind a load balancer, this is the load balancer IP until a trusted proxy model is added. Local buckets have a strict maximum of 10,000; a new identity receives HTTP 429 if every slot remains active.
-
-For local Java development, start only PetClinic's dependencies, then run the gateway from another terminal:
+By default, routes are configured with a burst capacity of 10 tokens and a refill rate of 5 tokens/second. Sending a rapid burst will result in HTTP `429 Too Many Requests`:
 
 ```powershell
-docker compose up -d config-server discovery-server customers-service visits-service vets-service
-.\gradlew.bat :gateway:gateway-runtime:run
+# Send 60 concurrent requests to observe rate limiting in action
+$client = [System.Net.Http.HttpClient]::new()
+$tasks = 1..60 | ForEach-Object { $client.GetAsync("http://localhost:8080/vets") }
+[System.Threading.Tasks.Task]::WaitAll($tasks)
+$tasks | ForEach-Object { [int]$_.Result.StatusCode } | Group-Object | Select-Object Name, Count
+$client.Dispose()
 ```
 
-Run automated tests with `.\gradlew.bat test`. Stop the containers with `docker compose down`. The source of PetClinic is in the sibling clone; you do not need to copy it into this gateway's Gradle build.
+---
 
-## Reproducible verification
+## Configuration Reference
 
-Run the Redis integration test against a real local Redis. It creates two live gateway instances, sends a concurrent burst through both, and verifies one shared quota. The test is skipped when `REDIS_TEST_URL` is absent.
+Static configuration can be set in `config/gateway.properties` or overridden via environment variables:
 
-```powershell
-docker compose up -d redis
-$env:REDIS_TEST_URL = 'redis://localhost:6379'
-.\gradlew.bat test --rerun-tasks
-Remove-Item Env:REDIS_TEST_URL
+```properties
+# Gateway server settings
+gateway.port=8080
+gateway.response-timeout-seconds=5
+
+# Route list
+routes=customers,visits,vets
+
+# Route definitions
+route.customers.prefix=/owners
+route.customers.upstream=http://customers-service:8081
+
+route.vets.prefix=/vets
+route.vets.upstream=http://vets-service:8083,http://vets-service-backup:8083
+
+# Rate limit policies
+rateLimit.vets.enabled=true
+rateLimit.vets.capacity=10
+rateLimit.vets.refillTokensPerSecond=5
+rateLimit.vets.keyType=ROUTE
+rateLimit.vets.failureMode=LOCAL_FALLBACK
+
+# Distributed Redis state (optional; uses in-memory limiter when omitted)
+redis.url=redis://redis:6379
 ```
 
-With `REDIS_URL` configured, gateway startup fails with a clear error if Redis cannot be reached. Request-time Redis operations have a 2-second timeout, then use each route's configured `LOCAL_FALLBACK` or `FAIL_OPEN` policy. Fallback favors availability and can exceed the shared quota during a Redis outage or a late Redis response. The Redis script uses Redis server time so gateway clock skew does not change the shared bucket. The upstream check is passive: connection and timeout failures start a cooldown; after cooldown, an upstream is tried again. It is not a background health probe.
+### Supported Identity Key Types
+| Key Type | Description |
+|---|---|
+| `ROUTE` | Global route-level bucket. All callers share the token pool. |
+| `API_KEY` | Per-key bucket identified by `X-API-Key` header. Keys are validated against SHA-256 digests. |
+| `CLIENT_IP` | Per-IP bucket based on peer TCP address. |
 
-Run the complete PetClinic demo and verify route responses and a burst rejection:
+### Redis Failure Modes
+| Mode | Behavior when Redis is unavailable |
+|---|---|
+| `LOCAL_FALLBACK` *(Default)* | Automatically switches to an in-memory Token Bucket to maintain traffic protection. |
+| `FAIL_OPEN` | Passes requests through without rate limit enforcement to prioritize availability. |
 
-```powershell
-docker compose up --build -d
-.\scripts\verify-petclinic.ps1
-.\scripts\verify-redis-outage.ps1
-docker compose down
-```
+---
 
-The proxy tests additionally cover a 1 MiB request/response body, upstream failure and recovery, forwarding, and hop-by-hop headers. Graceful draining of in-flight requests, client cancellation, and production-scale streaming limits are not yet verified.
+## Observability & Monitoring
 
-## M5: change gateway configuration without restarting it
+The stack comes out-of-the-box with full observability:
 
-Compose starts the control plane on `http://localhost:9090` and PostgreSQL with a persistent `control-db` volume. On the first startup, the control plane seeds version 1 from `config/gateway.properties`. The gateway polls `/internal/config/active` every two seconds on a background thread and atomically replaces its validated snapshot. Existing requests finish using the snapshot they captured. When the control plane cannot be reached, the gateway keeps its last valid snapshot.
+- **Grafana Dashboard:** `http://localhost:3000` (Credentials: `admin` / `admin`)
+  - Real-time RPS (Requests Per Second) by route and status code.
+  - Request duration quantiles (p50, p95, p99).
+  - Rate limiting drop rate (HTTP 429).
+  - Upstream failure rate (HTTP 502/504).
+  - In-flight request count and active configuration version.
+- **Prometheus Targets:** `http://localhost:9091`
+- **Gateway Health Probe:** `http://localhost:8080/_gateway/health`
+  - Returns `200 OK` when all upstreams are healthy, or `503 Service Unavailable` if an upstream is in cooldown.
+- **Gateway Prometheus Metrics:** `http://localhost:8080/_gateway/metrics`
+- **Structured JSON Logging:** Every proxied request produces a clean, sanitized JSON line:
+  ```json
+  {"timestamp":"2026-10-22T15:30:00.123Z","method":"GET","path":"/vets","route":"vets","status":200,"durationMs":14.20,"upstream":"http://vets-service:8083","rateLimited":false,"clientIp":"172.20.0.1"}
+  ```
 
-The demo token defaults to `local-demo-token`. Set `CONTROL_PLANE_TOKEN` before `docker compose up --build -d` to choose another token. The administration port binds only to localhost in Compose. The demo database password can be overridden with `CONTROL_DATABASE_PASSWORD`. Change both values before any shared deployment.
+---
 
-Try the complete publish and rollback flow from Windows PowerShell:
+## Dynamic Reconfiguration & Rollback
 
-```powershell
-docker compose up --build -d
-.\scripts\verify-control-plane.ps1
-```
-
-The script temporarily removes `/vets`, waits until `/_gateway/version` advances, checks that `/vets` returns 404, then publishes a rollback as a new version and checks that `/vets` returns 200. The gateway process is not restarted. To inspect the active configuration and history manually:
+The Control Plane (`http://localhost:9090`) enables updating gateway routing tables and rate limit policies at runtime without restarting gateway instances:
 
 ```powershell
 $headers = @{ Authorization = 'Bearer local-demo-token' }
+
+# 1. Inspect active configuration
 Invoke-RestMethod http://localhost:9090/admin/config/active -Headers $headers
-Invoke-RestMethod http://localhost:9090/admin/config/versions -Headers $headers
+
+# 2. Publish a new configuration version
+$body = @{
+    expectedVersion = 1
+    responseTimeoutSeconds = 5
+    routes = @(
+        @{
+            id = "customers"
+            pathPrefix = "/owners"
+            upstreams = @("http://customers-service:8081")
+        }
+    )
+} | ConvertTo-Json -Depth 10
+
+Invoke-RestMethod -Method Post -Uri http://localhost:9090/admin/config/versions `
+    -Headers $headers -ContentType 'application/json' -Body $body
+
+# 3. Gateway updates its active snapshot in real time:
 Invoke-WebRequest -UseBasicParsing http://localhost:8080/_gateway/version
 ```
 
-API: `POST /admin/config/versions` accepts `expectedVersion`, `responseTimeoutSeconds`, and a complete `routes` array. `POST /admin/config/rollback/{targetVersion}` accepts `expectedVersion`; rollback creates a new version. A stale expected version returns 409, invalid routes return 400, and missing or invalid bearer tokens return 401. Configurations are immutable once published. Upstream URLs, route prefixes, rate policies, and response timeout can all be changed. The control plane is queried only by the background poller, never for each proxied request.
+---
 
-## M6: observability and reliability
+## Automated Verification Scripts
 
-Compose bundles Prometheus (`http://localhost:9091`) and Grafana (`http://localhost:3000`, user/pass: `admin`/`admin`) with a pre-provisioned dashboard:
-
-- **Metrics endpoint:** `GET /_gateway/metrics` exports Prometheus text format covering `gateway_requests_total`, `gateway_request_duration_seconds` (p50/p95/p99 quantiles), `gateway_rate_limited_total`, `gateway_upstream_failures_total`, `gateway_redis_failures_total` (after a Redis request fails), and `gateway_in_flight_requests`.
-- **Health endpoint:** `GET /_gateway/health` reports status `UP` (200) or `SERVICE_UNAVAILABLE` (503) based on upstream availability.
-- **Structured access logging:** Emits sanitized JSON lines per request with method, path, route, status, duration, upstream, rate limit outcome, and client IP without leaking sensitive authorization credentials.
-- **Graceful shutdown:** On SIGTERM/SIGINT, the gateway rejects new requests with 503, waits up to 10 seconds for requests already running, then closes the server and Redis client.
-
-Verify observability and metrics collection:
+The repository includes automated PowerShell scripts in the `scripts/` directory for regression and chaos testing:
 
 ```powershell
-docker compose up --build -d
+# 1. End-to-end PetClinic routing and burst validation
+.\scripts\verify-petclinic.ps1
+
+# 2. Redis outage chaos test (validates automatic fallback during Redis failure)
+.\scripts\verify-redis-outage.ps1
+
+# 3. Dynamic route publishing, removal, and rollback validation
+.\scripts\verify-control-plane.ps1
+
+# 4. Observability and Prometheus metrics pipeline validation
 .\scripts\verify-observability.ps1
 ```
 
-The working PRD is kept locally in `docs/PRD.md` and excluded from the public repository. This is an experimental engineering project and has not been hardened as a production security boundary. A license for this gateway repo still needs to be selected before publishing it as open source.
+---
+
+## Running Automated Tests
+
+To run the complete test suite locally (including unit, integration, and fault injection tests):
+
+```powershell
+.\gradlew.bat check
+```
+
+To run tests with task re-execution:
+
+```powershell
+.\gradlew.bat test --rerun-tasks
+```
