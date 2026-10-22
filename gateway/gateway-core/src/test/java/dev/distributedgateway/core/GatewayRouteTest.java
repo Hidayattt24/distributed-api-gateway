@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.net.URI;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 
 class GatewayRouteTest {
@@ -18,6 +19,8 @@ class GatewayRouteTest {
                 () -> new GatewayRoute("id", "/trailing/", URI.create("http://localhost:8080")));
         assertThrows(IllegalArgumentException.class,
                 () -> new GatewayRoute("id", "/valid", URI.create("ftp://localhost:8080")));
+        assertThrows(IllegalArgumentException.class,
+                () -> new GatewayRoute("id", "/valid", List.of()));
     }
 
     @Test
