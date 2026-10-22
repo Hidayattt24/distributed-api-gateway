@@ -48,6 +48,39 @@ services:
     ports:
       - "6379:6379"
 
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: gateway
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: ${CONTROL_DATABASE_PASSWORD:-gateway-dev-password}
+    volumes:
+      - control-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    environment:
+      CONTROL_DATABASE_URL: jdbc:postgresql://postgres:5432/gateway
+      CONTROL_DATABASE_USER: gateway
+      CONTROL_DATABASE_PASSWORD: ${CONTROL_DATABASE_PASSWORD:-gateway-dev-password}
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-local-demo-token}
+      CONTROL_SEED_FILE: config/gateway.properties
+      CUSTOMERS_SERVICE_URL: http://customers-service:8081
+      VISITS_SERVICE_URL: http://visits-service:8082
+      VETS_SERVICE_URL: http://vets-service:8083
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   gateway:
     build:
       context: .
@@ -57,6 +90,9 @@ services:
       VISITS_SERVICE_URL: http://visits-service:8082
       VETS_SERVICE_URL: http://vets-service:8083
       REDIS_URL: redis://redis:6379
+      CONTROL_PLANE_URL: http://control-plane:9090/internal/config/active
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-local-demo-token}
+      CONTROL_PLANE_POLL_SECONDS: "2"
     ports:
       - "8080:8080"
     depends_on:
@@ -64,3 +100,7 @@ services:
       - visits-service
       - vets-service
       - redis
+      - control-plane
+
+volumes:
+  control-db:

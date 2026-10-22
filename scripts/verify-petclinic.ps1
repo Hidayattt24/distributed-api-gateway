@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Net.Http
 $client = [System.Net.Http.HttpClient]::new()
 $client.Timeout = [TimeSpan]::FromSeconds(10)
 

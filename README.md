@@ -9,6 +9,7 @@ The PetClinic source is kept in a separate local clone of [Spring PetClinic Micr
 - `gateway/gateway-core`: route matching, upstream pool load balancing, and Reactor Netty proxy.
 - `gateway/gateway-ratelimit`: Redis distributed Token Bucket (atomic Lua), key resolvers, and local fallback.
 - `gateway/gateway-runtime`: executable and configuration loader.
+- `control-plane`: Spring Boot administration API backed by PostgreSQL; stores immutable configuration versions.
 - PetClinic `customers-service`, `visits-service`, and `vets-service`: external upstream services. The cloned source lives outside this Gradle project.
 
 ## Run on Windows
@@ -67,5 +68,29 @@ docker compose down
 ```
 
 The proxy tests additionally cover a 1 MiB request/response body, upstream failure and recovery, forwarding, and hop-by-hop headers. Graceful draining of in-flight requests, client cancellation, and production-scale streaming limits are not yet verified.
+
+## M5: change gateway configuration without restarting it
+
+Compose starts the control plane on `http://localhost:9090` and PostgreSQL with a persistent `control-db` volume. On the first startup, the control plane seeds version 1 from `config/gateway.properties`. The gateway polls `/internal/config/active` every two seconds on a background thread and atomically replaces its validated snapshot. Existing requests finish using the snapshot they captured. When the control plane cannot be reached, the gateway keeps its last valid snapshot.
+
+The demo token defaults to `local-demo-token`. Set `CONTROL_PLANE_TOKEN` before `docker compose up --build -d` to choose another token. The administration port binds only to localhost in Compose. The demo database password can be overridden with `CONTROL_DATABASE_PASSWORD`. Change both values before any shared deployment.
+
+Try the complete publish and rollback flow from Windows PowerShell:
+
+```powershell
+docker compose up --build -d
+.\scripts\verify-control-plane.ps1
+```
+
+The script temporarily removes `/vets`, waits until `/_gateway/version` advances, checks that `/vets` returns 404, then publishes a rollback as a new version and checks that `/vets` returns 200. The gateway process is not restarted. To inspect the active configuration and history manually:
+
+```powershell
+$headers = @{ Authorization = 'Bearer local-demo-token' }
+Invoke-RestMethod http://localhost:9090/admin/config/active -Headers $headers
+Invoke-RestMethod http://localhost:9090/admin/config/versions -Headers $headers
+Invoke-WebRequest -UseBasicParsing http://localhost:8080/_gateway/version
+```
+
+API: `POST /admin/config/versions` accepts `expectedVersion`, `responseTimeoutSeconds`, and a complete `routes` array. `POST /admin/config/rollback/{targetVersion}` accepts `expectedVersion`; rollback creates a new version. A stale expected version returns 409, invalid routes return 400, and missing or invalid bearer tokens return 401. Configurations are immutable once published. Upstream URLs, route prefixes, rate policies, and response timeout can all be changed. The control plane is queried only by the background poller, never for each proxied request.
 
 The working PRD is kept locally in `docs/PRD.md` and excluded from the public repository. This is an experimental engineering project and has not been hardened as a production security boundary. A license for this gateway repo still needs to be selected before publishing it as open source.
