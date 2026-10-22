@@ -4,6 +4,7 @@ import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.timeout.ReadTimeoutException;
+import java.net.URI;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
@@ -28,6 +29,8 @@ public final class GatewayProxy {
     private final List<GatewayRoute> routes;
     private final Map<String, RateLimitPolicy> rateLimitPolicies;
     private final RateLimiter rateLimiter;
+    private final LoadBalancer loadBalancer;
+    private final ApiKeyVerifier apiKeyVerifier;
     private final HttpClient client;
 
     public GatewayProxy(List<GatewayRoute> routes, Duration responseTimeout) {
@@ -36,9 +39,23 @@ public final class GatewayProxy {
 
     public GatewayProxy(List<GatewayRoute> routes, Duration responseTimeout,
             Map<String, RateLimitPolicy> rateLimitPolicies, RateLimiter rateLimiter) {
+        this(routes, responseTimeout, rateLimitPolicies, rateLimiter, new LoadBalancer());
+    }
+
+    public GatewayProxy(List<GatewayRoute> routes, Duration responseTimeout,
+            Map<String, RateLimitPolicy> rateLimitPolicies, RateLimiter rateLimiter,
+            LoadBalancer loadBalancer) {
+        this(routes, responseTimeout, rateLimitPolicies, rateLimiter, loadBalancer, new ApiKeyVerifier(Map.of()));
+    }
+
+    public GatewayProxy(List<GatewayRoute> routes, Duration responseTimeout,
+            Map<String, RateLimitPolicy> rateLimitPolicies, RateLimiter rateLimiter,
+            LoadBalancer loadBalancer, ApiKeyVerifier apiKeyVerifier) {
         this.routes = List.copyOf(routes);
         this.rateLimitPolicies = Map.copyOf(rateLimitPolicies);
         this.rateLimiter = Objects.requireNonNull(rateLimiter);
+        this.loadBalancer = Objects.requireNonNull(loadBalancer);
+        this.apiKeyVerifier = Objects.requireNonNull(apiKeyVerifier);
         this.client = HttpClient.create().responseTimeout(responseTimeout);
     }
 
@@ -55,29 +72,53 @@ public final class GatewayProxy {
         }
 
         RateLimitPolicy policy = rateLimitPolicies.get(route.id());
-        Mono<Boolean> decision = policy == null
-                ? Mono.just(true)
-                : rateLimiter.allow(route.id(), policy);
-        return decision.flatMap(allowed -> allowed
-                ? forward(request, response, route)
-                : response.status(HttpResponseStatus.TOO_MANY_REQUESTS)
-                        .sendString(Mono.just("Rate limit exceeded"))
-                        .then());
+        if (policy == null) {
+            return forward(request, response, route, null);
+        }
+
+        var rateLimitKey = RateLimitKeyResolver.resolveKey(request, route, policy, apiKeyVerifier);
+        if (rateLimitKey.isEmpty()) {
+            return response.status(HttpResponseStatus.UNAUTHORIZED)
+                    .sendString(Mono.just("Invalid API key"))
+                    .then();
+        }
+        return rateLimiter.evaluate(rateLimitKey.orElseThrow(), policy)
+                .flatMap(decision -> {
+                    if (decision.allowed()) {
+                        return forward(request, response, route, decision);
+                    }
+                    response.status(HttpResponseStatus.TOO_MANY_REQUESTS)
+                            .header("X-RateLimit-Limit", String.valueOf(decision.limit()))
+                            .header("X-RateLimit-Remaining", String.valueOf(decision.remaining()))
+                            .header("Retry-After", String.valueOf(decision.retryAfterSeconds()));
+                    return response.sendString(Mono.just("Rate limit exceeded")).then();
+                });
     }
 
-    private Mono<Void> forward(HttpServerRequest request, HttpServerResponse response, GatewayRoute route) {
-        String target = route.upstream().toString().replaceAll("/+$", "") + request.uri();
+    private Mono<Void> forward(HttpServerRequest request, HttpServerResponse response, GatewayRoute route, RateLimitDecision decision) {
+        URI upstream = loadBalancer.select(route);
+        if (upstream == null) {
+            response.status(HttpResponseStatus.BAD_GATEWAY);
+            return response.sendString(Mono.just("All upstreams unavailable")).then();
+        }
+        String target = upstream.toString().replaceAll("/+$", "") + request.uri();
         return client.headers(headers -> copyHeaders(request.requestHeaders(), headers))
                 .request(request.method())
                 .uri(target)
                 .send((outboundRequest, outbound) -> outbound.send(request.receive().retain()))
                 .response((upstreamResponse, body) -> {
+                    loadBalancer.reportSuccess(upstream);
                     response.status(upstreamResponse.status());
                     copyHeaders(upstreamResponse.responseHeaders(), response.responseHeaders());
+                    if (decision != null) {
+                        response.header("X-RateLimit-Limit", String.valueOf(decision.limit()));
+                        response.header("X-RateLimit-Remaining", String.valueOf(decision.remaining()));
+                    }
                     return response.send(body.retain()).then();
                 })
                 .then()
                 .onErrorResume(error -> {
+                    loadBalancer.reportFailure(upstream);
                     if (response.hasSentHeaders()) {
                         return Mono.error(error);
                     }

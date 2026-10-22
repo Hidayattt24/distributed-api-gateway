@@ -7,7 +7,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.net.URI;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -186,5 +189,203 @@ class GatewayProxyTest {
             gateway.disposeNow();
             backend.disposeNow();
         }
+    }
+
+    @Test
+    void distributesRequestsRoundRobinAcrossMultipleUpstreamsAndFailsOver() throws Exception {
+        AtomicInteger server1Count = new AtomicInteger();
+        AtomicInteger server2Count = new AtomicInteger();
+
+        DisposableServer server1 = HttpServer.create().port(0).handle((request, response) -> {
+            server1Count.incrementAndGet();
+            return response.sendString(Mono.just("server1"));
+        }).bindNow();
+
+        DisposableServer server2 = HttpServer.create().port(0).handle((request, response) -> {
+            server2Count.incrementAndGet();
+            return response.sendString(Mono.just("server2"));
+        }).bindNow();
+
+        GatewayRoute route = new GatewayRoute("api", "/api", List.of(
+                URI.create("http://localhost:" + server1.port()),
+                URI.create("http://localhost:" + server2.port())
+        ));
+
+        DisposableServer gateway = new GatewayProxy(List.of(route), Duration.ofSeconds(3)).start(0);
+
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            String base = "http://localhost:" + gateway.port();
+
+            for (int i = 0; i < 4; i++) {
+                var res = client.send(HttpRequest.newBuilder(URI.create(base + "/api/test")).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertEquals(200, res.statusCode());
+            }
+            assertEquals(2, server1Count.get());
+            assertEquals(2, server2Count.get());
+
+            server1.disposeNow();
+
+            var failRes = client.send(HttpRequest.newBuilder(URI.create(base + "/api/test")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(502, failRes.statusCode());
+
+            for (int i = 0; i < 3; i++) {
+                var res = client.send(HttpRequest.newBuilder(URI.create(base + "/api/test")).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertEquals(200, res.statusCode());
+                assertEquals("server2", res.body());
+            }
+            assertEquals(5, server2Count.get());
+        } finally {
+            gateway.disposeNow();
+            server2.disposeNow();
+        }
+    }
+
+    @Test
+    void includesRateLimitHeadersOnAllowedAndRejectedRequests() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("ok")))
+                .bindNow();
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("vets", "/vets", URI.create("http://localhost:" + backend.port()))),
+                Duration.ofSeconds(3),
+                Map.of("vets", new RateLimitPolicy(2, 1.0)),
+                new LocalTokenBucketRateLimiter(() -> 0L)).start(0);
+
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            String base = "http://localhost:" + gateway.port();
+
+            var res1 = client.send(HttpRequest.newBuilder(URI.create(base + "/vets")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, res1.statusCode());
+            assertEquals("2", res1.headers().firstValue("X-RateLimit-Limit").orElseThrow());
+            assertEquals("1", res1.headers().firstValue("X-RateLimit-Remaining").orElseThrow());
+
+            var res2 = client.send(HttpRequest.newBuilder(URI.create(base + "/vets")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, res2.statusCode());
+            assertEquals("2", res2.headers().firstValue("X-RateLimit-Limit").orElseThrow());
+            assertEquals("0", res2.headers().firstValue("X-RateLimit-Remaining").orElseThrow());
+
+            var res3 = client.send(HttpRequest.newBuilder(URI.create(base + "/vets")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(429, res3.statusCode());
+            assertEquals("2", res3.headers().firstValue("X-RateLimit-Limit").orElseThrow());
+            assertEquals("0", res3.headers().firstValue("X-RateLimit-Remaining").orElseThrow());
+            assertTrue(res3.headers().firstValue("Retry-After").isPresent());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
+    void rateLimitsPerApiKeyWhenConfigured() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("ok")))
+                .bindNow();
+        GatewayRoute route = new GatewayRoute("customers", "/customers", URI.create("http://localhost:" + backend.port()));
+        RateLimitPolicy policy = new RateLimitPolicy(1, 1.0, RateLimitPolicy.KeyType.API_KEY);
+
+        DisposableServer gateway = new GatewayProxy(
+                List.of(route),
+                Duration.ofSeconds(3),
+                Map.of("customers", policy),
+                new LocalTokenBucketRateLimiter(() -> 0L),
+                new LoadBalancer(),
+                new ApiKeyVerifier(Map.of("customers", List.of(hash("key-a"), hash("key-b"))))).start(0);
+
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            String base = "http://localhost:" + gateway.port();
+
+            var resA1 = client.send(HttpRequest.newBuilder(URI.create(base + "/customers/1"))
+                    .header("X-API-Key", "key-a").GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, resA1.statusCode());
+
+            var resB1 = client.send(HttpRequest.newBuilder(URI.create(base + "/customers/2"))
+                    .header("X-API-Key", "key-b").GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, resB1.statusCode());
+
+            var resA2 = client.send(HttpRequest.newBuilder(URI.create(base + "/customers/1"))
+                    .header("X-API-Key", "key-a").GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(429, resA2.statusCode());
+
+            var invalid = client.send(HttpRequest.newBuilder(URI.create(base + "/customers/1"))
+                    .header("X-API-Key", "unknown").GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(401, invalid.statusCode());
+            var missing = client.send(HttpRequest.newBuilder(URI.create(base + "/customers/1"))
+                    .GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(401, missing.statusCode());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
+    void isolatesApiKeyBucketsByRoute() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("ok"))).bindNow();
+        URI upstream = URI.create("http://localhost:" + backend.port());
+        RateLimitPolicy policy = new RateLimitPolicy(1, 1, RateLimitPolicy.KeyType.API_KEY);
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("one", "/one", upstream), new GatewayRoute("two", "/two", upstream)),
+                Duration.ofSeconds(3), Map.of("one", policy, "two", policy),
+                new LocalTokenBucketRateLimiter(() -> 0L), new LoadBalancer(),
+                new ApiKeyVerifier(Map.of("one", List.of(hash("same-key")),
+                        "two", List.of(hash("same-key"))))).start(0);
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            String base = "http://localhost:" + gateway.port();
+            for (String path : List.of("/one", "/two")) {
+                var result = client.send(HttpRequest.newBuilder(URI.create(base + path))
+                        .header("X-API-Key", "same-key").GET().build(), HttpResponse.BodyHandlers.ofString());
+                assertEquals(200, result.statusCode());
+            }
+            var limited = client.send(HttpRequest.newBuilder(URI.create(base + "/one"))
+                    .header("X-API-Key", "same-key").GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertEquals(429, limited.statusCode());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
+    void clientIpBucketIgnoresSourcePortAndIsolatedByRoute() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("ok"))).bindNow();
+        URI upstream = URI.create("http://localhost:" + backend.port());
+        RateLimitPolicy policy = new RateLimitPolicy(1, 1, RateLimitPolicy.KeyType.CLIENT_IP);
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("one", "/one", upstream), new GatewayRoute("two", "/two", upstream)),
+                Duration.ofSeconds(3), Map.of("one", policy, "two", policy),
+                new LocalTokenBucketRateLimiter(() -> 0L)).start(0);
+        try {
+            String base = "http://localhost:" + gateway.port();
+            for (String path : List.of("/one", "/two")) {
+                var result = java.net.http.HttpClient.newHttpClient().send(
+                        HttpRequest.newBuilder(URI.create(base + path)).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertEquals(200, result.statusCode());
+            }
+            var limited = java.net.http.HttpClient.newHttpClient().send(
+                    HttpRequest.newBuilder(URI.create(base + "/one")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(429, limited.statusCode());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    private static String hash(String value) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(value.getBytes(StandardCharsets.UTF_8)));
     }
 }
