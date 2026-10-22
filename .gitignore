@@ -5,3 +5,7 @@
 .vscode/
 *.iml
 *.log
+
+# docs & opencode
+.opencode/
+docs/
