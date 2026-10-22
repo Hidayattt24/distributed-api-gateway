@@ -1,20 +1,59 @@
 services:
-  user-service:
-    build:
-      context: .
-      dockerfile: Dockerfile.user-service
-    environment:
-      USER_SERVICE_PORT: "8081"
+  config-server:
+    image: springcommunity/spring-petclinic-config-server
+    healthcheck:
+      test: ["CMD", "curl", "-I", "http://localhost:8888"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  discovery-server:
+    image: springcommunity/spring-petclinic-discovery-server
+    depends_on:
+      config-server:
+        condition: service_healthy
+
+  customers-service:
+    image: springcommunity/spring-petclinic-customers-service
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
     ports:
       - "8081:8081"
+
+  visits-service:
+    image: springcommunity/spring-petclinic-visits-service
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    ports:
+      - "8082:8082"
+
+  vets-service:
+    image: springcommunity/spring-petclinic-vets-service
+    depends_on:
+      config-server:
+        condition: service_healthy
+      discovery-server:
+        condition: service_started
+    ports:
+      - "8083:8083"
 
   gateway:
     build:
       context: .
       dockerfile: Dockerfile.gateway
     environment:
-      USER_SERVICE_URL: http://user-service:8081
+      CUSTOMERS_SERVICE_URL: http://customers-service:8081
+      VISITS_SERVICE_URL: http://visits-service:8082
+      VETS_SERVICE_URL: http://vets-service:8083
     ports:
       - "8080:8080"
     depends_on:
-      - user-service
+      - customers-service
+      - visits-service
+      - vets-service
