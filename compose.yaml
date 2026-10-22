@@ -1,0 +1,20 @@
+services:
+  user-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.user-service
+    environment:
+      USER_SERVICE_PORT: "8081"
+    ports:
+      - "8081:8081"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    environment:
+      USER_SERVICE_URL: http://user-service:8081
+    ports:
+      - "8080:8080"
+    depends_on:
+      - user-service

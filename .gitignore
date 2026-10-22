@@ -1,0 +1,7 @@
+.gradle/
+.gradle-user-home/
+**/build/
+.idea/
+.vscode/
+*.iml
+*.log

@@ -1,0 +1,5 @@
+rootProject.name = 'distributed-api-gateway'
+
+include 'gateway:gateway-core'
+include 'gateway:gateway-runtime'
+include 'examples:user-service'
