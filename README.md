@@ -1,6 +1,6 @@
 # Distributed API Gateway
 
-High-performance, non-blocking HTTP API Gateway built with **Java 21**, **Reactor Netty**, and **Redis**. Designed as a robust single entry point for distributed microservices architectures, featuring atomic Token Bucket rate limiting, upstream load balancing with passive health recovery, zero-downtime dynamic reconfiguration, and full Prometheus/Grafana observability.
+Experimental HTTP/1.1 API gateway built with **Java 21** and **Reactor Netty**. It provides routing, local or Redis-backed token bucket rate limiting, passive upstream recovery, versioned configuration and Prometheus/Grafana observability. It has not been hardened or benchmarked for production use.
 
 ---
 
@@ -24,13 +24,13 @@ High-performance, non-blocking HTTP API Gateway built with **Java 21**, **Reacto
 
 ## Overview
 
-Modern microservices split backend functionality across dozens of independent HTTP services. Exposing each service directly to the public internet creates security vulnerabilities, complicated client applications, network overhead, and difficult traffic management.
+Modern microservices often expose multiple HTTP services. This gateway provides one configurable entry point for local experiments with routing and traffic management.
 
 **Distributed API Gateway** solves this by sitting between external clients and backend microservices:
 1. **Single Public Entry Point:** Clients communicate with one domain/port; internal services remain private.
-2. **Traffic Protection:** Distributed Token Bucket algorithm drops abusive traffic at the perimeter before it exhausts backend resources.
+2. **Traffic Protection:** Local or Redis-backed token bucket limits requests before they reach a backend.
 3. **Resilience & Fault Isolation:** Unhealthy upstream instances are automatically removed from rotation and gradually retried after a cooldown period.
-4. **Zero-Downtime Updates:** Routes, rate limits, and upstreams can be modified and rolled back via a secure Control Plane API without restarting the gateway data plane.
+4. **Runtime Updates:** Routes, rate limits, and upstreams can be modified and rolled back through the authenticated Control Plane API without restarting the gateway data plane.
 
 ---
 
@@ -73,7 +73,7 @@ The gateway acts as an intelligent, high-throughput reverse proxy:
                                       ▼
                       ┌───────────────────────────────┐
                       │    DISTRIBUTED API GATEWAY    │
-                      │  - SSL Termination            │
+                      │  - HTTP/1.1 forwarding        │
                       │  - Path Prefix Routing        │
                       │  - Redis Token Bucket Limiter │
                       │  - Round Robin Load Balancer  │
@@ -93,8 +93,8 @@ The gateway acts as an intelligent, high-throughput reverse proxy:
 ```
 
 **Benefits:**
-- **Zero Public Exposure:** Backends operate in private networks without public IPs.
-- **Centralized Security:** SSL certificates, CORS policies, and authentication checks happen in one place.
+- **Deployment choice:** Backends stay on the private Compose network. The demo does not publish PetClinic or Redis ports to the host.
+- **Central routing:** Clients can address one gateway endpoint. TLS, CORS and general authentication are outside the current gateway scope.
 - **Shielded Microservices:** Requests exceeding quotas are dropped at the perimeter with `HTTP 429 Too Many Requests`.
 - **Seamless Failover:** Load balancer automatically bypasses unresponsive nodes without client awareness.
 
@@ -132,8 +132,8 @@ The project strictly decouples traffic forwarding from configuration management:
  └────────────────────────────────────────────────────────────┘
 ```
 
-- **Data Plane (High Performance):** Built with pure Reactor Netty. Completely non-blocking event-loop architecture. Handles millions of proxied requests with sub-millisecond overhead without framework bloat.
-- **Control Plane (Management & Safety):** Built with Spring Boot and PostgreSQL. Allows platform engineers to add routes, adjust rate limits, change upstream pools, or trigger immediate rollbacks with zero gateway downtime.
+- **Data Plane:** Built with Reactor Netty. Forwarding uses non-blocking I/O; throughput and latency require workload-specific measurement.
+- **Control Plane:** Built with Spring Boot and PostgreSQL. It validates and versions changes, while gateways poll the active snapshot.
 
 ---
 
@@ -149,7 +149,7 @@ The project strictly decouples traffic forwarding from configuration management:
 - **Round-Robin Load Balancing:** Distributes requests evenly across upstream pools.
 - **Passive Failure Detection:** Unresponsive or timed-out upstreams are isolated into a 10-second cooldown period, then gradually re-introduced upon recovery.
 - **Standard HTTP Rate Limit Headers:** Emits `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After` (on 429).
-- **Graceful Shutdown & Request Draining:** On `SIGTERM`/`SIGINT`, the gateway halts new connections, drains in-flight requests for up to 10 seconds, and cleanly closes socket pools and Redis connections.
+- **Request Draining:** On `SIGTERM`/`SIGINT`, the gateway rejects new requests with 503, waits up to 10 seconds for in-flight requests, then closes the server and Redis client.
 - **Comprehensive Observability:** Prometheus metrics (`/_gateway/metrics`), health status probe (`/_gateway/health`), and structured JSON access logs.
 
 ---
@@ -196,9 +196,12 @@ This repository uses a reference set of backend microservices based on the [Spri
 Start the gateway, reference microservices, Redis, PostgreSQL, Control Plane, Prometheus, and Grafana:
 
 ```powershell
+.\scripts\init-local-secrets.ps1
 docker compose up --build -d
 docker compose ps
 ```
+
+The setup script generates random local credentials in an ignored `.env` file. Keep it private. Redis and the PetClinic services stay inside the Compose network. Gateway management, Prometheus and Grafana host ports bind only to `127.0.0.1`. Prometheus accesses management port `9092` inside the Compose network.
 
 *(Note: The first launch pulls container images and initializes the demo services; this may take 1-3 minutes).*
 
@@ -237,7 +240,7 @@ $client.Dispose()
 
 ## Configuration Reference
 
-Static configuration can be set in `config/gateway.properties` or overridden via environment variables:
+Initial configuration can be set in `config/gateway.properties` with supported environment overrides. After the control plane database has been seeded, change active policies through its API rather than editing this file:
 
 ```properties
 # Gateway server settings
@@ -284,16 +287,18 @@ redis.url=redis://redis:6379
 
 The stack comes out-of-the-box with full observability:
 
-- **Grafana Dashboard:** `http://localhost:3000` (Credentials: `admin` / `admin`)
+- **Grafana Dashboard:** `http://localhost:3000` (user `admin`; password in the ignored `.env` file)
   - Real-time RPS (Requests Per Second) by route and status code.
   - Request duration quantiles (p50, p95, p99).
   - Rate limiting drop rate (HTTP 429).
   - Upstream failure rate (HTTP 502/504).
   - In-flight request count and active configuration version.
 - **Prometheus Targets:** `http://localhost:9091`
-- **Gateway Health Probe:** `http://localhost:8080/_gateway/health`
+- **Gateway Health Probe:** `http://localhost:9092/_gateway/health`
   - Returns `200 OK` when all upstreams are healthy, or `503 Service Unavailable` if an upstream is in cooldown.
-- **Gateway Prometheus Metrics:** `http://localhost:8080/_gateway/metrics`
+- **Gateway Prometheus Metrics:** `http://localhost:9092/_gateway/metrics`
+
+The public gateway port (`8080`) returns 404 for `/_gateway/*`. Outside Compose, management binds to `127.0.0.1` by default. Requests larger than 1 MiB receive 413; more than 256 active requests receive 503. For routes using `API_KEY`, the gateway verifies `X-API-Key` and removes it before forwarding to the microservice.
 - **Structured JSON Logging:** Every proxied request produces a clean, sanitized JSON line:
   ```json
   {"timestamp":"2026-10-22T15:30:00.123Z","method":"GET","path":"/vets","route":"vets","status":200,"durationMs":14.20,"upstream":"http://vets-service:8083","rateLimited":false,"clientIp":"172.20.0.1"}
@@ -306,7 +311,9 @@ The stack comes out-of-the-box with full observability:
 The Control Plane (`http://localhost:9090`) enables updating gateway routing tables and rate limit policies at runtime without restarting gateway instances:
 
 ```powershell
-$headers = @{ Authorization = 'Bearer local-demo-token' }
+$secrets = Get-Content .env | ConvertFrom-StringData
+$env:CONTROL_PLANE_TOKEN = $secrets.CONTROL_PLANE_TOKEN
+$headers = @{ Authorization = "Bearer $env:CONTROL_PLANE_TOKEN" }
 
 # 1. Inspect active configuration
 Invoke-RestMethod http://localhost:9090/admin/config/active -Headers $headers
@@ -328,7 +335,7 @@ Invoke-RestMethod -Method Post -Uri http://localhost:9090/admin/config/versions 
     -Headers $headers -ContentType 'application/json' -Body $body
 
 # 3. Gateway updates its active snapshot in real time:
-Invoke-WebRequest -UseBasicParsing http://localhost:8080/_gateway/version
+Invoke-WebRequest -UseBasicParsing http://localhost:9092/_gateway/version
 ```
 
 ---
@@ -366,3 +373,11 @@ To run tests with task re-execution:
 ```powershell
 .\gradlew.bat test --rerun-tasks
 ```
+
+## Experiments and release preparation
+
+- [M7 comparison](experiments/README.md): deterministic token bucket versus fixed-window baseline, with [recorded results](experiments/baseline/report.md) and raw CSV. Fixed window is an experiment, not a live policy.
+- [Custom backend example](examples/custom-backend/README.md): run the gateway against a Python HTTP service instead of PetClinic.
+- [Release guide](RELEASING.md), [changelog](CHANGELOG.md), [contributing guide](CONTRIBUTING.md), [security policy](SECURITY.md), and [Apache-2.0 license](LICENSE).
+
+Version `0.1.0` source is prepared locally. The gateway ZIP includes `LICENSE` and starter `config/gateway.properties`. CI builds tests, distribution archives and images; no GitHub Release or registry image has been published. Read [SECURITY.md](SECURITY.md) and verify the release checklist before considering any public deployment.
