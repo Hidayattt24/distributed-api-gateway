@@ -10,3 +10,18 @@ dependencies {
 application {
     mainClass = 'dev.distributedgateway.runtime.GatewayApplication'
 }
+
+distributions {
+    main {
+        contents {
+            from(rootProject.file('LICENSE'))
+            from(rootProject.file('config/gateway.properties')) {
+                into 'config'
+            }
+        }
+    }
+}
+
+tasks.named('run') {
+    workingDir = rootProject.projectDir
+}

@@ -4,3 +4,13 @@
 .idea
 .vscode
 *.log
+.env
+.env.*
+.opencode/
+docs/
+.github/
+examples/
+scripts/
+experiments/results/
+experiments/baseline/
+**/src/test/

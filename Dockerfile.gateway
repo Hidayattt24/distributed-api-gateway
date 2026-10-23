@@ -7,5 +7,7 @@ FROM eclipse-temurin:21-jre
 WORKDIR /app
 COPY --from=build /app/gateway/gateway-runtime/build/install/gateway-runtime /app/gateway
 COPY config/gateway.properties /app/config/gateway.properties
-EXPOSE 8080
+COPY LICENSE /app/LICENSE
+EXPOSE 8080 9092
+USER 10001:10001
 CMD ["/app/gateway/bin/gateway-runtime"]
