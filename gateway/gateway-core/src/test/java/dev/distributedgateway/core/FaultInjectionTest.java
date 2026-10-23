@@ -19,6 +19,31 @@ import reactor.netty.http.server.HttpServer;
 
 class FaultInjectionTest {
     @Test
+    void rejectsWhenInFlightCapacityIsFull() throws Exception {
+        GatewayMetrics metrics = new GatewayMetrics();
+        for (int index = 0; index < 256; index++) {
+            metrics.requestStarted();
+        }
+        GatewayProxy gateway = new GatewayProxy(
+                List.of(new GatewayRoute("demo", "/demo", URI.create("http://localhost:1"))),
+                Duration.ofSeconds(3), java.util.Map.of(), new LocalTokenBucketRateLimiter(),
+                new LoadBalancer(), new ApiKeyVerifier(java.util.Map.of()), metrics, new AccessLogger(s -> {}));
+        DisposableServer server = gateway.start(0);
+        try {
+            var response = java.net.http.HttpClient.newHttpClient().send(HttpRequest.newBuilder(
+                    URI.create("http://localhost:" + server.port() + "/demo")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(503, response.statusCode());
+            assertEquals("1", response.headers().firstValue("Retry-After").orElseThrow());
+        } finally {
+            server.disposeNow();
+            for (int index = 0; index < 256; index++) {
+                metrics.requestFinished();
+            }
+        }
+    }
+
+    @Test
     void drainRejectsNewRequestsWhileExistingResponseCompletesAndMeasuresFullDuration() throws Exception {
         DisposableServer backend = HttpServer.create().port(0).handle((req, resp) ->
                 resp.sendString(Flux.concat(Mono.just("first"),
@@ -44,6 +69,10 @@ class FaultInjectionTest {
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(503, rejected.statusCode());
             assertEquals(200, first.get(3, TimeUnit.SECONDS).statusCode());
+            long drainedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (metrics.inFlightCount() != 0 && System.nanoTime() < drainedDeadline) {
+                Thread.sleep(10);
+            }
             assertEquals(0, metrics.inFlightCount());
             var timer = metrics.registry().find("gateway_request_duration_seconds")
                     .tag("route", "stream").tag("status_class", "2xx").timer();
@@ -104,6 +133,7 @@ class FaultInjectionTest {
                 java.util.Map.of(), new LocalTokenBucketRateLimiter(), loadBalancer,
                 new ApiKeyVerifier(java.util.Map.of()), metrics, new AccessLogger(s -> {}));
         DisposableServer server = gateway.start(0);
+        DisposableServer management = gateway.startManagement("127.0.0.1", 0);
 
         try {
             var client = java.net.http.HttpClient.newHttpClient();
@@ -116,7 +146,8 @@ class FaultInjectionTest {
             assertEquals("healthy-response", ok.body());
 
             // Check health endpoint
-            var health = client.send(HttpRequest.newBuilder(URI.create(base + "/_gateway/health")).GET().build(),
+            String managementBase = "http://localhost:" + management.port();
+            var health = client.send(HttpRequest.newBuilder(URI.create(managementBase + "/_gateway/health")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(200, health.statusCode());
             assertTrue(health.body().contains("\"UP\""));
@@ -133,7 +164,7 @@ class FaultInjectionTest {
             assertTrue(scrape.contains("gateway_upstream_health"));
             assertTrue(scrape.contains("reason=\"unavailable\""));
 
-            var unhealthCheck = client.send(HttpRequest.newBuilder(URI.create(base + "/_gateway/health")).GET().build(),
+            var unhealthCheck = client.send(HttpRequest.newBuilder(URI.create(managementBase + "/_gateway/health")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(503, unhealthCheck.statusCode());
             assertTrue(unhealthCheck.body().contains("\"DOWN\""));
@@ -152,7 +183,7 @@ class FaultInjectionTest {
                 assertEquals(200, recovered.statusCode());
                 assertEquals("recovered", recovered.body());
 
-                var recoveredHealth = client.send(HttpRequest.newBuilder(URI.create(base + "/_gateway/health")).GET().build(),
+                var recoveredHealth = client.send(HttpRequest.newBuilder(URI.create(managementBase + "/_gateway/health")).GET().build(),
                         HttpResponse.BodyHandlers.ofString());
                 assertEquals(200, recoveredHealth.statusCode());
                 assertTrue(recoveredHealth.body().contains("\"UP\""));
@@ -160,6 +191,7 @@ class FaultInjectionTest {
                 restoredBackend.disposeNow();
             }
         } finally {
+            management.disposeNow();
             server.disposeNow();
         }
     }
@@ -173,6 +205,7 @@ class FaultInjectionTest {
         GatewayRoute route = new GatewayRoute("demo", "/demo", URI.create("http://localhost:" + backend.port()));
         GatewayProxy gateway = new GatewayProxy(List.of(route), Duration.ofSeconds(3));
         DisposableServer server = gateway.start(0);
+        DisposableServer management = gateway.startManagement("127.0.0.1", 0);
 
         try {
             var client = java.net.http.HttpClient.newHttpClient();
@@ -181,13 +214,18 @@ class FaultInjectionTest {
             client.send(HttpRequest.newBuilder(URI.create(base + "/demo/1")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
 
-            var metricsRes = client.send(HttpRequest.newBuilder(URI.create(base + "/_gateway/metrics")).GET().build(),
+            var publicMetrics = client.send(HttpRequest.newBuilder(URI.create(base + "/_gateway/metrics")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(404, publicMetrics.statusCode());
+            var metricsRes = client.send(HttpRequest.newBuilder(URI.create("http://localhost:"
+                    + management.port() + "/_gateway/metrics")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(200, metricsRes.statusCode());
             assertTrue(metricsRes.headers().firstValue("Content-Type").orElse("").contains("text/plain"));
             assertTrue(metricsRes.body().contains("gateway_requests_total"));
             assertTrue(metricsRes.body().contains("route=\"demo\""));
         } finally {
+            management.disposeNow();
             server.disposeNow();
             backend.disposeNow();
         }

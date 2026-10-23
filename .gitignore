@@ -5,7 +5,11 @@
 .vscode/
 *.iml
 *.log
+.env
 
 # docs & opencode
 .opencode/
 docs/
+experiments/results/
+__pycache__/
+PRODUCTION_READINESS.md

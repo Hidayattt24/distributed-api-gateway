@@ -65,6 +65,50 @@ class GatewayProxyTest {
     }
 
     @Test
+    void rejectsOversizedRequestBeforeForwarding() throws Exception {
+        AtomicInteger forwarded = new AtomicInteger();
+        DisposableServer backend = HttpServer.create().port(0).handle((request, response) -> {
+            forwarded.incrementAndGet();
+            return response.sendString(Mono.just("unexpected"));
+        }).bindNow();
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("upload", "/upload", URI.create("http://localhost:" + backend.port()))),
+                Duration.ofSeconds(3)).start(0);
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            var result = client.send(HttpRequest.newBuilder(URI.create("http://localhost:" + gateway.port() + "/upload"))
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(new byte[1024 * 1024 + 1])).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(413, result.statusCode());
+            assertEquals(0, forwarded.get());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
+    void rejectsOversizedChunkedRequestWhileStreaming() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(request.receive().aggregate().asString()))
+                .bindNow();
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("upload", "/upload", URI.create("http://localhost:" + backend.port()))),
+                Duration.ofSeconds(3)).start(0);
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            var result = client.send(HttpRequest.newBuilder(URI.create("http://localhost:" + gateway.port() + "/upload"))
+                    .POST(HttpRequest.BodyPublishers.ofInputStream(
+                            () -> new java.io.ByteArrayInputStream(new byte[1024 * 1024 + 1]))).build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(413, result.statusCode());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
     void reportsUpstreamTimeout() throws Exception {
         DisposableServer backend = HttpServer.create().port(0)
                 .handle((request, response) -> response.sendString(Mono.delay(Duration.ofSeconds(2)).map(value -> "late")))
@@ -144,6 +188,7 @@ class GatewayProxyTest {
     void filtersHopByHopHeaders() throws Exception {
         AtomicBoolean receivedHopHeader = new AtomicBoolean(false);
         AtomicBoolean receivedCustomHeader = new AtomicBoolean(false);
+        AtomicBoolean receivedSpoofedIdentity = new AtomicBoolean(false);
 
         DisposableServer backend = HttpServer.create().port(0).handle((request, response) -> {
             if (request.requestHeaders().contains("X-Hop-Header")
@@ -153,6 +198,10 @@ class GatewayProxyTest {
             }
             if ("custom-value".equals(request.requestHeaders().get("X-Custom-Header"))) {
                 receivedCustomHeader.set(true);
+            }
+            if (request.requestHeaders().contains("X-Forwarded-For")
+                    || request.requestHeaders().contains("Forwarded")) {
+                receivedSpoofedIdentity.set(true);
             }
             return response.header("X-Response-Custom", "backend-value")
                     .header("Keep-Alive", "timeout=5")
@@ -170,6 +219,8 @@ class GatewayProxyTest {
                             .add("Keep-Alive", "timeout=10")
                             .add("Proxy-Connection", "keep-alive")
                             .add("Connection", "close, X-Hop-Header")
+                            .add("X-Forwarded-For", "203.0.113.42")
+                            .add("Forwarded", "for=203.0.113.42")
                             .add("X-Hop-Header", "should-be-stripped"))
                     .get()
                     .uri("http://localhost:" + gateway.port() + "/users/test")
@@ -185,6 +236,7 @@ class GatewayProxyTest {
             assertEquals("filtered", responseBody);
             assertTrue(receivedCustomHeader.get(), "Custom header should reach backend");
             assertFalse(receivedHopHeader.get(), "Hop-by-hop headers should not reach backend");
+            assertFalse(receivedSpoofedIdentity.get(), "Untrusted client identity must not reach backend");
         } finally {
             gateway.disposeNow();
             backend.disposeNow();
@@ -285,8 +337,12 @@ class GatewayProxyTest {
 
     @Test
     void rateLimitsPerApiKeyWhenConfigured() throws Exception {
+        AtomicBoolean apiKeyReachedBackend = new AtomicBoolean(false);
         DisposableServer backend = HttpServer.create().port(0)
-                .handle((request, response) -> response.sendString(Mono.just("ok")))
+                .handle((request, response) -> {
+                    apiKeyReachedBackend.set(request.requestHeaders().contains("X-API-Key"));
+                    return response.sendString(Mono.just("ok"));
+                })
                 .bindNow();
         GatewayRoute route = new GatewayRoute("customers", "/customers", URI.create("http://localhost:" + backend.port()));
         RateLimitPolicy policy = new RateLimitPolicy(1, 1.0, RateLimitPolicy.KeyType.API_KEY);
@@ -310,6 +366,7 @@ class GatewayProxyTest {
             var resB1 = client.send(HttpRequest.newBuilder(URI.create(base + "/customers/2"))
                     .header("X-API-Key", "key-b").GET().build(), HttpResponse.BodyHandlers.ofString());
             assertEquals(200, resB1.statusCode());
+            assertFalse(apiKeyReachedBackend.get(), "Gateway API key must stay at the gateway");
 
             var resA2 = client.send(HttpRequest.newBuilder(URI.create(base + "/customers/1"))
                     .header("X-API-Key", "key-a").GET().build(), HttpResponse.BodyHandlers.ofString());

@@ -38,6 +38,7 @@ class GatewayConfigTest {
                 new GatewayConfig.RouteDefinition("first", "/first", List.of(address), null)));
         GatewayProxy proxy = new GatewayProxy(first, new LocalTokenBucketRateLimiter());
         DisposableServer server = proxy.start(0);
+        DisposableServer management = proxy.startManagement("127.0.0.1", 0);
         try {
             HttpClient client = HttpClient.newHttpClient();
             String base = "http://localhost:" + server.port();
@@ -47,10 +48,13 @@ class GatewayConfigTest {
             proxy.install(second);
             assertEquals(404, status(client, base + "/first"));
             assertEquals(200, status(client, base + "/second"));
-            assertEquals("2", client.send(HttpRequest.newBuilder(URI.create(base + "/_gateway/version"))
+            assertEquals(404, status(client, base + "/_gateway/version"));
+            assertEquals("2", client.send(HttpRequest.newBuilder(URI.create("http://localhost:"
+                            + management.port() + "/_gateway/version"))
                     .GET().build(), HttpResponse.BodyHandlers.ofString()).body());
             assertThrows(IllegalArgumentException.class, () -> proxy.install(first));
         } finally {
+            management.disposeNow();
             server.disposeNow();
             upstream.disposeNow();
         }

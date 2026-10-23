@@ -1,5 +1,6 @@
 param(
     [string]$GatewayUrl = 'http://localhost:8080',
+    [string]$ManagementUrl = 'http://localhost:9092',
     [string]$PrometheusUrl = 'http://localhost:9091'
 )
 
@@ -9,11 +10,11 @@ $client = [System.Net.Http.HttpClient]::new()
 $client.Timeout = [TimeSpan]::FromSeconds(10)
 
 try {
-    Write-Output "1. Checking Gateway Health Endpoint ($GatewayUrl/_gateway/health)..."
+    Write-Output "1. Checking Gateway Health Endpoint ($ManagementUrl/_gateway/health)..."
     $healthRes = $null
     for ($attempt = 1; $attempt -le 10; $attempt++) {
         try {
-            $healthRes = $client.GetAsync("$GatewayUrl/_gateway/health").GetAwaiter().GetResult()
+            $healthRes = $client.GetAsync("$ManagementUrl/_gateway/health").GetAwaiter().GetResult()
             break
         } catch {
             if ($attempt -eq 10) { throw }
@@ -26,8 +27,8 @@ try {
         throw "Gateway health check failed: $([int]$healthRes.StatusCode)"
     }
 
-    Write-Output "2. Checking Gateway Version Endpoint ($GatewayUrl/_gateway/version)..."
-    $versionRes = $client.GetAsync("$GatewayUrl/_gateway/version").GetAwaiter().GetResult()
+    Write-Output "2. Checking Gateway Version Endpoint ($ManagementUrl/_gateway/version)..."
+    $versionRes = $client.GetAsync("$ManagementUrl/_gateway/version").GetAwaiter().GetResult()
     $versionBody = $versionRes.Content.ReadAsStringAsync().GetAwaiter().GetResult()
     Write-Output "Active Version: $versionBody"
     if ($versionRes.StatusCode -ne [System.Net.HttpStatusCode]::OK -or [string]::IsNullOrWhiteSpace($versionBody)) {
@@ -39,8 +40,8 @@ try {
         $sampleRes = $client.GetAsync("$GatewayUrl/vets").GetAwaiter().GetResult()
     }
 
-    Write-Output "4. Checking Gateway Prometheus Metrics ($GatewayUrl/_gateway/metrics)..."
-    $metricsRes = $client.GetAsync("$GatewayUrl/_gateway/metrics").GetAwaiter().GetResult()
+    Write-Output "4. Checking Gateway Prometheus Metrics ($ManagementUrl/_gateway/metrics)..."
+    $metricsRes = $client.GetAsync("$ManagementUrl/_gateway/metrics").GetAwaiter().GetResult()
     $metricsBody = $metricsRes.Content.ReadAsStringAsync().GetAwaiter().GetResult()
     if ($metricsRes.StatusCode -ne [System.Net.HttpStatusCode]::OK) {
         throw "Metrics endpoint failed: $([int]$metricsRes.StatusCode)"

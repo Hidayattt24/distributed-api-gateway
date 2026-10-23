@@ -40,6 +40,9 @@ public final class GatewayApplication {
 
         GatewayProxy proxy = new GatewayProxy(initial, rateLimiter, metrics, new AccessLogger());
         DisposableServer server = proxy.start(port);
+        String managementHost = System.getenv().getOrDefault("GATEWAY_MANAGEMENT_HOST", "127.0.0.1");
+        int managementPort = Integer.parseInt(System.getenv().getOrDefault("GATEWAY_MANAGEMENT_PORT", "9092"));
+        DisposableServer managementServer = proxy.startManagement(managementHost, managementPort);
 
         String controlUrl = System.getenv().getOrDefault("CONTROL_PLANE_URL", "");
         ControlPlaneSubscriber subscriber = null;
@@ -71,6 +74,7 @@ public final class GatewayApplication {
             }
             try {
                 server.disposeNow();
+                managementServer.disposeNow();
             } catch (Exception ignored) {
             }
             if (rateLimiter instanceof AutoCloseable closeable) {
@@ -84,6 +88,7 @@ public final class GatewayApplication {
 
         System.out.printf("Gateway listening on http://localhost:%d; initial configuration version %d%n",
                 server.port(), proxy.activeVersion());
+        System.out.printf("Gateway management listening on %s:%d%n", managementHost, managementServer.port());
         server.onDispose().block();
     }
 }

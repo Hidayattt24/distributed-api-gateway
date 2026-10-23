@@ -20,8 +20,6 @@ services:
         condition: service_healthy
       discovery-server:
         condition: service_started
-    ports:
-      - "8081:8081"
 
   visits-service:
     image: springcommunity/spring-petclinic-visits-service
@@ -30,8 +28,6 @@ services:
         condition: service_healthy
       discovery-server:
         condition: service_started
-    ports:
-      - "8082:8082"
 
   vets-service:
     image: springcommunity/spring-petclinic-vets-service
@@ -40,20 +36,16 @@ services:
         condition: service_healthy
       discovery-server:
         condition: service_started
-    ports:
-      - "8083:8083"
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
 
   postgres:
     image: postgres:17-alpine
     environment:
       POSTGRES_DB: gateway
       POSTGRES_USER: gateway
-      POSTGRES_PASSWORD: ${CONTROL_DATABASE_PASSWORD:-gateway-dev-password}
+      POSTGRES_PASSWORD: ${CONTROL_DATABASE_PASSWORD:?Set CONTROL_DATABASE_PASSWORD in .env}
     volumes:
       - control-db:/var/lib/postgresql/data
     healthcheck:
@@ -69,8 +61,8 @@ services:
     environment:
       CONTROL_DATABASE_URL: jdbc:postgresql://postgres:5432/gateway
       CONTROL_DATABASE_USER: gateway
-      CONTROL_DATABASE_PASSWORD: ${CONTROL_DATABASE_PASSWORD:-gateway-dev-password}
-      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-local-demo-token}
+      CONTROL_DATABASE_PASSWORD: ${CONTROL_DATABASE_PASSWORD:?Set CONTROL_DATABASE_PASSWORD in .env}
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:?Set CONTROL_PLANE_TOKEN in .env}
       CONTROL_SEED_FILE: config/gateway.properties
       CUSTOMERS_SERVICE_URL: http://customers-service:8081
       VISITS_SERVICE_URL: http://visits-service:8082
@@ -91,10 +83,12 @@ services:
       VETS_SERVICE_URL: http://vets-service:8083
       REDIS_URL: redis://redis:6379
       CONTROL_PLANE_URL: http://control-plane:9090/internal/config/active
-      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:-local-demo-token}
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:?Set CONTROL_PLANE_TOKEN in .env}
       CONTROL_PLANE_POLL_SECONDS: "2"
+      GATEWAY_MANAGEMENT_HOST: 0.0.0.0
     ports:
       - "8080:8080"
+      - "127.0.0.1:9092:9092"
     depends_on:
       - customers-service
       - visits-service
@@ -107,20 +101,20 @@ services:
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     depends_on:
       - gateway
 
   grafana:
     image: grafana/grafana:11.2.0
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./deploy/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
       - ./deploy/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - prometheus
 

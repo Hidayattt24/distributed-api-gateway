@@ -1,17 +1,25 @@
 param(
     [string]$ControlUrl = 'http://localhost:9090',
-    [string]$GatewayUrl = 'http://localhost:8080'
+    [string]$GatewayUrl = 'http://localhost:8080',
+    [string]$ManagementUrl = 'http://localhost:9092'
 )
 
 $ErrorActionPreference = 'Stop'
-$token = if ($env:CONTROL_PLANE_TOKEN) { $env:CONTROL_PLANE_TOKEN } else { 'local-demo-token' }
+$token = $env:CONTROL_PLANE_TOKEN
+if ([string]::IsNullOrWhiteSpace($token)) {
+    $secretFile = Join-Path (Split-Path -Parent $PSScriptRoot) '.env'
+    if (Test-Path -LiteralPath $secretFile) {
+        $token = (Get-Content -LiteralPath $secretFile | ConvertFrom-StringData).CONTROL_PLANE_TOKEN
+    }
+}
+if ([string]::IsNullOrWhiteSpace($token)) { throw 'Set CONTROL_PLANE_TOKEN before running this script.' }
 $headers = @{ Authorization = "Bearer $token" }
 $initial = Invoke-RestMethod -Uri "$ControlUrl/admin/config/active" -Headers $headers
 $published = $null
 
 function Wait-GatewayVersion([long]$expected) {
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        $current = [long](Invoke-WebRequest -UseBasicParsing -Uri "$GatewayUrl/_gateway/version").Content
+        $current = [long](Invoke-WebRequest -UseBasicParsing -Uri "$ManagementUrl/_gateway/version").Content
         if ($current -eq $expected) { return }
         Start-Sleep -Seconds 1
     }
