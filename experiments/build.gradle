@@ -1,0 +1,11 @@
+plugins {
+    id 'application'
+}
+
+dependencies {
+    implementation project(':gateway:gateway-core')
+}
+
+application {
+    mainClass = 'dev.distributedgateway.experiments.LimiterComparison'
+}
