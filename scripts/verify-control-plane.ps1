@@ -42,8 +42,8 @@ try {
     try {
         Invoke-WebRequest -UseBasicParsing -Uri "$GatewayUrl/vets" | Out-Null
         throw 'Expected /vets to return 404 after route removal.'
-    } catch [System.Net.WebException] {
-        if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+    } catch {
+        if ($null -eq $_.Exception.Response -or [int]$_.Exception.Response.StatusCode -ne 404) { throw }
     }
     Write-Output "Published version $($published.version): /vets -> 404 without gateway restart"
 } finally {
@@ -64,4 +64,4 @@ try {
     }
 }
 
-Write-Output 'M5 control plane verification PASS'
+Write-Output 'Control plane verification PASS'

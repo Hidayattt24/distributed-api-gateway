@@ -2,6 +2,8 @@
 
 Experimental HTTP/1.1 API gateway built with **Java 21** and **Reactor Netty**. It provides routing, local or Redis-backed token bucket rate limiting, passive upstream recovery, versioned configuration and Prometheus/Grafana observability. It has not been hardened or benchmarked for production use.
 
+A separate [production deployment template](deploy/production/README.md) now covers HTTPS ingress, private services, upstream allowlisting, trusted client identity, and strict Redis failure behavior. It requires environment-specific verification before use.
+
 ---
 
 ## Table of Contents
@@ -15,6 +17,7 @@ Experimental HTTP/1.1 API gateway built with **Java 21** and **Reactor Netty**. 
 - [Project Modules](#project-modules)
 - [Reference Demo Microservices](#reference-demo-microservices)
 - [Quick Start](#quick-start)
+- [Request flow from a frontend](#request-flow-from-a-frontend)
 - [Configuration Reference](#configuration-reference)
 - [Observability & Monitoring](#observability--monitoring)
 - [Dynamic Reconfiguration & Rollback](#dynamic-reconfiguration--rollback)
@@ -94,7 +97,7 @@ The gateway acts as an intelligent, high-throughput reverse proxy:
 
 **Benefits:**
 - **Deployment choice:** Backends stay on the private Compose network. The demo does not publish PetClinic or Redis ports to the host.
-- **Central routing:** Clients can address one gateway endpoint. TLS, CORS and general authentication are outside the current gateway scope.
+- **Central routing:** Clients can address one gateway endpoint. The production template terminates TLS at NGINX; API-key authentication is available per route. General identity-provider integration remains application-specific.
 - **Shielded Microservices:** Requests exceeding quotas are dropped at the perimeter with `HTTP 429 Too Many Requests`.
 - **Seamless Failover:** Load balancer automatically bypasses unresponsive nodes without client awareness.
 
@@ -187,21 +190,23 @@ This repository uses a reference set of backend microservices based on the [Spri
 ## Quick Start
 
 ### Prerequisites
-- **JDK 21** or later
-- **Docker Desktop** (with Docker Compose v2)
-- **Git**
+- **Windows PowerShell 5.1 or newer**, **Git**, and **Docker Desktop** with Linux containers and Docker Compose v2
+- **JDK 21** for Gradle tests or running outside Docker
+- **Python 3** only for the optional dashboard traffic demo
 
-### 1. Launch the Complete Stack
+### 1. Clone and launch the demo stack
 
 Start the gateway, reference microservices, Redis, PostgreSQL, Control Plane, Prometheus, and Grafana:
 
 ```powershell
+git clone https://github.com/Hidayattt24/distributed-api-gateway.git
+cd distributed-api-gateway
 .\scripts\init-local-secrets.ps1
 docker compose up --build -d
 docker compose ps
 ```
 
-The setup script generates random local credentials in an ignored `.env` file. Keep it private. Redis and the PetClinic services stay inside the Compose network. Gateway management, Prometheus and Grafana host ports bind only to `127.0.0.1`. Prometheus accesses management port `9092` inside the Compose network.
+Run commands from the repository root. Skip cloning if you already have the repository. If GitHub asks for access, clone with an account that can read the repository. The public root [`.env.example`](.env.example) lists all required variable names; the setup script generates their real values in the ignored **root `.env`**, used only by this local demo. Production has its own `.env.example` and ignored `deploy/production/.env`. See the [production environment guide](deploy/production/README.md#environment-files). Redis and PetClinic stay inside the Compose network. Gateway management, Prometheus and Grafana host ports bind only to `127.0.0.1`. After startup, check `curl.exe -i http://localhost:8080/vets` and `curl.exe -i http://localhost:9092/_gateway/health`.
 
 *(Note: The first launch pulls container images and initializes the demo services; this may take 1-3 minutes).*
 
@@ -236,11 +241,36 @@ $tasks | ForEach-Object { [int]$_.Result.StatusCode } | Group-Object | Select-Ob
 $client.Dispose()
 ```
 
+If Windows PowerShell reports that `HttpClient` is missing, first run `Add-Type -AssemblyName System.Net.Http`. The summary should show both `200` and `429`; counts depend on request timing and the bucket's current tokens.
+
+### 4. Open monitoring and stop the demo
+
+Open Grafana at `http://localhost:3000` (user `admin`; password `GRAFANA_ADMIN_PASSWORD` in `.env`), then open **Distributed API Gateway Overview**. Prometheus is at `http://localhost:9091`. When finished, run `docker compose down` from the repository root. This preserves PostgreSQL data; `docker compose down -v` also deletes the local database volume.
+
+---
+
+## Request flow from a frontend
+
+```mermaid
+flowchart LR
+    F["Web or mobile frontend"] -->|"GET http://localhost:8080/vets"| G["Gateway :8080"]
+    G --> R["Match route prefix /vets"]
+    R --> L{"Rate limit policy"}
+    L -->|Allowed| U["vets-service :8083"]
+    L -->|Exhausted| X["Gateway returns HTTP 429"]
+    U -->|Response| G
+    G -->|"HTTP 200 + JSON"| F
+```
+
+Set your frontend's API base URL to `http://localhost:8080` for this local demo and call `/vets` or another configured path. The frontend does not call the internal PetClinic address. The gateway matches the path prefix, checks its policy, forwards the original path, and returns the upstream response. An empty bucket produces `429` with `Retry-After`; requests are not queued automatically. A browser frontend on a different origin also needs a CORS policy in its hosting/proxy layer or upstream service. Do not embed secret API keys in browser code; keep them on a trusted server or use an appropriate user authentication design.
+
 ---
 
 ## Configuration Reference
 
-Initial configuration can be set in `config/gateway.properties` with supported environment overrides. After the control plane database has been seeded, change active policies through its API rather than editing this file:
+The source file [`config/gateway.properties`](config/gateway.properties) supplies the **initial configuration**. On the first Compose startup, the control plane stores that snapshot in PostgreSQL; its container environment overrides the sample `localhost` upstreams with Compose service names. On later startups, editing the file alone does **not** change the active database snapshot. Use the control plane API to publish a new version, or reset the local database volume only when you intentionally want a fresh demo. The gateway polls the active version about every two seconds and applies it without a restart.
+
+Example route and policy settings:
 
 ```properties
 # Gateway server settings
@@ -255,7 +285,7 @@ route.customers.prefix=/owners
 route.customers.upstream=http://customers-service:8081
 
 route.vets.prefix=/vets
-route.vets.upstream=http://vets-service:8083,http://vets-service-backup:8083
+route.vets.upstream=http://vets-service:8083
 
 # Rate limit policies
 rateLimit.vets.enabled=true
@@ -267,6 +297,10 @@ rateLimit.vets.failureMode=LOCAL_FALLBACK
 # Distributed Redis state (optional; uses in-memory limiter when omitted)
 redis.url=redis://redis:6379
 ```
+
+`route.vets.prefix=/vets` selects incoming `/vets` paths; `route.vets.upstream` names the private service that receives them. `capacity=10` allows an initial burst of ten tokens; `refillTokensPerSecond=5` replenishes five tokens each second up to capacity. `keyType=ROUTE` shares one bucket among callers; `CLIENT_IP` separates buckets by resolved client IP; `API_KEY` separates buckets by validated key and requires SHA-256 hashes via `RATE_LIMIT_VETS_API_KEY_SHA256`. Redis is optional outside Compose; the demo Compose stack enables distributed quota storage through `REDIS_URL`.
+
+The operator-owned `GATEWAY_ALLOWED_UPSTREAMS` list restricts published destinations. If you add an upstream in the control plane, add its exact scheme, host and port to that list on both the gateway and control plane first. The allowed list is a deployment setting, not a field that an admin route update can expand.
 
 ### Supported Identity Key Types
 | Key Type | Description |
@@ -280,6 +314,9 @@ redis.url=redis://redis:6379
 |---|---|
 | `LOCAL_FALLBACK` *(Default)* | Automatically switches to an in-memory Token Bucket to maintain traffic protection. |
 | `FAIL_OPEN` | Passes requests through without rate limit enforcement to prioritize availability. |
+| `FAIL_CLOSED` | Returns HTTP 503 with `Retry-After` when Redis cannot decide; suitable for strict shared quotas. |
+
+The gateway returns `200` when an allowed upstream responds successfully, `401` for a missing or invalid key on an `API_KEY` route, `429` when the quota is exhausted, and `503` for an unavailable strict Redis decision or an overloaded/draining gateway. Other upstream response codes pass through as appropriate.
 
 ---
 
@@ -298,6 +335,20 @@ The stack comes out-of-the-box with full observability:
   - Returns `200 OK` when all upstreams are healthy, or `503 Service Unavailable` if an upstream is in cooldown.
 - **Gateway Prometheus Metrics:** `http://localhost:9092/_gateway/metrics`
 
+### Local dashboard example
+
+The screenshot below is from a local PetClinic demo using the `/vets` route, a shared `ROUTE` bucket with capacity **10** and refill **5 tokens/second**, and Redis-backed quota storage. A bounded run sent **2,400 requests** over **120 seconds** at a target of **20 requests/second**: **604 returned 200** and **1,796 returned 429**. The dashboard shows successful traffic and rejected traffic separately. This demonstrates rate-limit behavior; it is **not** a gateway throughput or production capacity benchmark.
+
+![Grafana dashboard showing local /vets traffic with 200 and 429 responses](assets/grafana-rate-limit-demo.png)
+
+To reproduce it on the local stack, confirm that `curl.exe -i http://localhost:8080/vets` returns 200, then run:
+
+```powershell
+python scripts/demo-traffic.py --url http://127.0.0.1:8080/vets --seconds 120 --rps 20
+```
+
+Open **Distributed API Gateway Overview** at `http://localhost:3000`, select the last **5 minutes**, and look at **Request Rate (RPS by Route & Status)** and **Rate Limited Requests**. The script accepts only a loopback HTTP `/vets` URL and caps its duration and request rate. Your counts can differ if the bucket has existing tokens or other requests arrive. Grafana plots per-second rates calculated over a one-minute window, so the line heights do not equal the total counts printed by the script.
+
 The public gateway port (`8080`) returns 404 for `/_gateway/*`. Outside Compose, management binds to `127.0.0.1` by default. Requests larger than 1 MiB receive 413; more than 256 active requests receive 503. For routes using `API_KEY`, the gateway verifies `X-API-Key` and removes it before forwarding to the microservice.
 - **Structured JSON Logging:** Every proxied request produces a clean, sanitized JSON line:
   ```json
@@ -315,34 +366,45 @@ $secrets = Get-Content .env | ConvertFrom-StringData
 $env:CONTROL_PLANE_TOKEN = $secrets.CONTROL_PLANE_TOKEN
 $headers = @{ Authorization = "Bearer $env:CONTROL_PLANE_TOKEN" }
 
-# 1. Inspect active configuration
-Invoke-RestMethod http://localhost:9090/admin/config/active -Headers $headers
+# 1. Read the complete active configuration
+$active = Invoke-RestMethod http://localhost:9090/admin/config/active -Headers $headers
 
-# 2. Publish a new configuration version
+# 2. Change only the vets capacity and preserve all other routes/policies
+$vets = $active.routes | Where-Object { $_.id -eq 'vets' }
+$vets.policy.capacity = 20
 $body = @{
-    expectedVersion = 1
-    responseTimeoutSeconds = 5
-    routes = @(
-        @{
-            id = "customers"
-            pathPrefix = "/owners"
-            upstreams = @("http://customers-service:8081")
-        }
-    )
+    expectedVersion = $active.version
+    responseTimeoutSeconds = $active.responseTimeoutSeconds
+    routes = $active.routes
 } | ConvertTo-Json -Depth 10
 
 Invoke-RestMethod -Method Post -Uri http://localhost:9090/admin/config/versions `
     -Headers $headers -ContentType 'application/json' -Body $body
 
-# 3. Gateway updates its active snapshot in real time:
+# 3. Gateway picks up the new active snapshot shortly afterward:
 Invoke-WebRequest -UseBasicParsing http://localhost:9092/_gateway/version
 ```
+
+The publish request replaces the **whole** active snapshot. Keep routes you are not changing in the request. Run this after the dashboard demo if you want to keep its documented ten-token capacity.
 
 ---
 
 ## Automated Verification Scripts
 
-The repository includes automated PowerShell scripts in the `scripts/` directory for regression and chaos testing:
+Only `init-local-secrets.ps1` is needed for the quick-start Docker demo. The other scripts are optional and each has a separate purpose:
+
+| Script | When to use it |
+|---|---|
+| `init-local-secrets.ps1` | Create the ignored root `.env` for the local demo. |
+| `demo-traffic.py` | Generate bounded localhost traffic for the Grafana screenshot. |
+| `verify-petclinic.ps1` | Check routing, 404, and rate-limit responses against the demo services. |
+| `verify-observability.ps1` | Check management health, metrics, and Prometheus. |
+| `verify-control-plane.ps1` | Publish a temporary route change and roll it back. |
+| `verify-redis-outage.ps1` | Test the selected Redis failure behavior locally. |
+| `init-production-env.ps1` | Create an ignored production `.env`; not needed for the local demo. |
+| `package-release.ps1` | Build release artifacts and checksums for maintainers. |
+
+The verification scripts are useful before publishing changes; they are not services that run continuously. Run them from the repository root:
 
 ```powershell
 # 1. End-to-end PetClinic routing and burst validation
@@ -376,7 +438,7 @@ To run tests with task re-execution:
 
 ## Experiments and release preparation
 
-- [M7 comparison](experiments/README.md): deterministic token bucket versus fixed-window baseline, with [recorded results](experiments/baseline/report.md) and raw CSV. Fixed window is an experiment, not a live policy.
+- [Rate limiter comparison](experiments/README.md): deterministic token bucket versus fixed-window baseline, with [recorded results](experiments/baseline/report.md) and raw CSV. Fixed window is an experiment, not a live policy.
 - [Custom backend example](examples/custom-backend/README.md): run the gateway against a Python HTTP service instead of PetClinic.
 - [Release guide](RELEASING.md), [changelog](CHANGELOG.md), [contributing guide](CONTRIBUTING.md), [security policy](SECURITY.md), and [Apache-2.0 license](LICENSE).
 

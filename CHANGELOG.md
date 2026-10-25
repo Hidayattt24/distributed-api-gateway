@@ -6,7 +6,7 @@
 - Local and Redis-backed token bucket, route policies and failure fallback.
 - Spring Boot control plane with versioned PostgreSQL configuration and rollback.
 - Prometheus metrics, Grafana dashboard, access logs and request draining.
-- Deterministic M7 local fixed-window comparison and raw baseline results.
+- Deterministic local fixed-window comparison and raw baseline results.
 - CI, Apache-2.0 license and a custom-backend example.
 - Separate management listener, private demo dependencies, generated local credentials, non-root runtime images, and request bounds.
 
