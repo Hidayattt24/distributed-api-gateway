@@ -4,6 +4,7 @@ import dev.distributedgateway.core.LocalTokenBucketRateLimiter;
 import dev.distributedgateway.core.GatewayMetrics;
 import dev.distributedgateway.core.RateLimitDecision;
 import dev.distributedgateway.core.RateLimitPolicy;
+import dev.distributedgateway.core.RateLimitUnavailableException;
 import dev.distributedgateway.core.RateLimiter;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
@@ -143,6 +144,9 @@ public final class RedisRateLimiter implements RateLimiter, AutoCloseable {
                     }
                     if (policy.failureMode() == RateLimitPolicy.RedisFailureMode.FAIL_OPEN) {
                         return Mono.just(RateLimitDecision.allowed(policy.capacity(), policy.capacity()));
+                    }
+                    if (policy.failureMode() == RateLimitPolicy.RedisFailureMode.FAIL_CLOSED) {
+                        return Mono.error(new RateLimitUnavailableException(error));
                     }
                     return localFallback.evaluate(key, policy);
                 });

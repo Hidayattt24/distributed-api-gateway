@@ -6,6 +6,8 @@ import dev.distributedgateway.core.GatewayMetrics;
 import dev.distributedgateway.core.AccessLogger;
 import dev.distributedgateway.core.LocalTokenBucketRateLimiter;
 import dev.distributedgateway.core.RateLimiter;
+import dev.distributedgateway.core.UpstreamAllowlist;
+import dev.distributedgateway.core.ClientIdentityResolver;
 import dev.distributedgateway.ratelimit.RedisRateLimiter;
 import java.io.InputStream;
 import java.net.URI;
@@ -25,6 +27,13 @@ public final class GatewayApplication {
             properties.load(input);
         }
         GatewayConfig initial = GatewayConfig.fromProperties(properties, System.getenv(), 1);
+        UpstreamAllowlist allowlist = UpstreamAllowlist.fromCsv(
+                System.getenv("GATEWAY_ALLOWED_UPSTREAMS"),
+                Boolean.parseBoolean(System.getenv().getOrDefault("GATEWAY_REQUIRE_UPSTREAM_ALLOWLIST", "false")));
+        allowlist.validate(initial);
+        ClientIdentityResolver identityResolver = ClientIdentityResolver.fromCsv(
+                System.getenv("GATEWAY_TRUSTED_PROXY_IPS"),
+                Boolean.parseBoolean(System.getenv().getOrDefault("GATEWAY_REQUIRE_TRUSTED_PROXY", "false")));
         int port = Integer.parseInt(System.getenv().getOrDefault("GATEWAY_PORT",
                 properties.getProperty("gateway.port", "8080")));
         String redisUrl = System.getenv().getOrDefault("REDIS_URL", properties.getProperty("redis.url", ""));
@@ -38,7 +47,8 @@ public final class GatewayApplication {
             rateLimiter = new LocalTokenBucketRateLimiter();
         }
 
-        GatewayProxy proxy = new GatewayProxy(initial, rateLimiter, metrics, new AccessLogger());
+        GatewayProxy proxy = new GatewayProxy(initial, rateLimiter, metrics, new AccessLogger(),
+                allowlist, identityResolver);
         DisposableServer server = proxy.start(port);
         String managementHost = System.getenv().getOrDefault("GATEWAY_MANAGEMENT_HOST", "127.0.0.1");
         int managementPort = Integer.parseInt(System.getenv().getOrDefault("GATEWAY_MANAGEMENT_PORT", "9092"));

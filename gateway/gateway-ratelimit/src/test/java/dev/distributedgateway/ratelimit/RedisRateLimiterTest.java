@@ -9,6 +9,7 @@ import dev.distributedgateway.core.LocalTokenBucketRateLimiter;
 import dev.distributedgateway.core.GatewayMetrics;
 import dev.distributedgateway.core.RateLimitDecision;
 import dev.distributedgateway.core.RateLimitPolicy;
+import dev.distributedgateway.core.RateLimitUnavailableException;
 import io.lettuce.core.RedisException;
 import io.lettuce.core.api.reactive.RedisReactiveCommands;
 import java.lang.reflect.Proxy;
@@ -20,6 +21,20 @@ import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 
 class RedisRateLimiterTest {
+    @Test
+    void failsClosedWhenRedisFailsUnderStrictPolicy() {
+        @SuppressWarnings("unchecked")
+        RedisReactiveCommands<String, String> brokenRedis = (RedisReactiveCommands<String, String>) Proxy.newProxyInstance(
+                RedisReactiveCommands.class.getClassLoader(),
+                new Class<?>[]{RedisReactiveCommands.class},
+                (proxy, method, args) -> Flux.error(new RedisException("Redis unavailable")));
+        RedisRateLimiter limiter = new RedisRateLimiter(brokenRedis, new LocalTokenBucketRateLimiter());
+        RateLimitPolicy policy = new RateLimitPolicy(5, 1.0, RateLimitPolicy.KeyType.ROUTE,
+                RateLimitPolicy.RedisFailureMode.FAIL_CLOSED);
+        assertThrows(RateLimitUnavailableException.class,
+                () -> limiter.evaluate("route1", policy).block());
+    }
+
     @Test
     void fallsBackWhenRedisCommandNeverCompletes() {
         @SuppressWarnings("unchecked")

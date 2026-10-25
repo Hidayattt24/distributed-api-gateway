@@ -11,7 +11,7 @@ public record RateLimitPolicy(
     }
 
     public enum RedisFailureMode {
-        LOCAL_FALLBACK, FAIL_OPEN
+        LOCAL_FALLBACK, FAIL_OPEN, FAIL_CLOSED
     }
 
     public RateLimitPolicy(int capacity, double refillTokensPerSecond) {

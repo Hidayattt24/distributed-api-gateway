@@ -1,6 +1,7 @@
 package dev.distributedgateway.control;
 
 import dev.distributedgateway.core.GatewayConfig;
+import dev.distributedgateway.core.UpstreamAllowlist;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
@@ -19,9 +20,13 @@ import org.springframework.web.server.ResponseStatusException;
 @Service
 public class ConfigStore {
     private final JdbcTemplate jdbc;
+    private final UpstreamAllowlist allowlist;
 
-    public ConfigStore(JdbcTemplate jdbc, @Value("${control.seed-file}") String seedFile) throws IOException {
+    public ConfigStore(JdbcTemplate jdbc, @Value("${control.seed-file}") String seedFile,
+            @Value("${gateway.allowed-upstreams:}") String allowedUpstreams,
+            @Value("${gateway.require-allowlist:false}") boolean requireAllowlist) throws IOException {
         this.jdbc = jdbc;
+        this.allowlist = UpstreamAllowlist.fromCsv(allowedUpstreams, requireAllowlist);
         jdbc.execute("CREATE TABLE IF NOT EXISTS config_versions (version BIGINT PRIMARY KEY, payload TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL)");
         jdbc.execute("CREATE TABLE IF NOT EXISTS config_meta (id INTEGER PRIMARY KEY, active_version BIGINT NOT NULL)");
         Long count = jdbc.queryForObject("SELECT COUNT(*) FROM config_meta", Long.class);
@@ -31,6 +36,7 @@ public class ConfigStore {
                 properties.load(input);
             }
             GatewayConfig initial = GatewayConfig.fromProperties(properties, System.getenv(), 1);
+            allowlist.validate(initial);
             jdbc.update("INSERT INTO config_versions (version, payload) VALUES (?, ?)", 1L, encode(initial));
             jdbc.update("INSERT INTO config_meta (id, active_version) VALUES (1, 1)");
         }
@@ -47,7 +53,9 @@ public class ConfigStore {
         if (payloads.isEmpty()) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Configuration version not found");
         }
-        return decode(payloads.getFirst(), version);
+        GatewayConfig config = decode(payloads.getFirst(), version);
+        allowlist.validate(config);
+        return config;
     }
 
     public List<VersionInfo> versions() {
@@ -66,6 +74,7 @@ public class ConfigStore {
             throw new ResponseStatusException(HttpStatus.CONFLICT, "Active version is " + current);
         }
         GatewayConfig next = new GatewayConfig(current + 1, timeoutSeconds, routes);
+        allowlist.validate(next);
         storeAndActivate(next);
         return next;
     }

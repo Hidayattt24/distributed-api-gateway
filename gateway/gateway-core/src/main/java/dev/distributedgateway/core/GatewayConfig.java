@@ -29,10 +29,10 @@ public record GatewayConfig(long version, long responseTimeoutSeconds, List<Rout
             upstreams = List.copyOf(upstreams);
             for (String address : upstreams) {
                 URI uri = URI.create(address);
-                if (!"http".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null
+                if (!("http".equalsIgnoreCase(uri.getScheme()) || "https".equalsIgnoreCase(uri.getScheme())) || uri.getHost() == null
                         || uri.getRawUserInfo() != null || uri.getRawQuery() != null || uri.getRawFragment() != null
                         || (uri.getPath() != null && !uri.getPath().isEmpty() && !"/".equals(uri.getPath()))) {
-                    throw new IllegalArgumentException("Upstream must be an HTTP origin: " + address);
+                    throw new IllegalArgumentException("Upstream must be an HTTP(S) origin: " + address);
                 }
             }
             new GatewayRoute(id, pathPrefix, URI.create(upstreams.getFirst()));

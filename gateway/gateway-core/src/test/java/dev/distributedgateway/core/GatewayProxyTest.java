@@ -163,6 +163,29 @@ class GatewayProxyTest {
     }
 
     @Test
+    void returns503WhenStrictQuotaStoreIsUnavailable() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("unexpected"))).bindNow();
+        DisposableServer gateway = new GatewayProxy(
+                List.of(new GatewayRoute("strict", "/strict", URI.create("http://localhost:" + backend.port()))),
+                Duration.ofSeconds(3),
+                Map.of("strict", new RateLimitPolicy(1, 1.0, RateLimitPolicy.KeyType.ROUTE,
+                        RateLimitPolicy.RedisFailureMode.FAIL_CLOSED)),
+                (key, policy) -> Mono.error(new RateLimitUnavailableException(new IllegalStateException("offline"))))
+                .start(0);
+        try {
+            var result = java.net.http.HttpClient.newHttpClient().send(HttpRequest.newBuilder(
+                    URI.create("http://localhost:" + gateway.port() + "/strict")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(503, result.statusCode());
+            assertTrue(result.headers().firstValue("Retry-After").isPresent());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
     void reportsUpstreamUnavailableWhenConnectionFails() throws Exception {
         DisposableServer backend = HttpServer.create().port(0)
                 .handle((request, response) -> response.sendString(Mono.just("ok")))
@@ -435,6 +458,45 @@ class GatewayProxyTest {
                     HttpRequest.newBuilder(URI.create(base + "/one")).GET().build(),
                     HttpResponse.BodyHandlers.ofString());
             assertEquals(429, limited.statusCode());
+        } finally {
+            gateway.disposeNow();
+            backend.disposeNow();
+        }
+    }
+
+    @Test
+    void trustedProxyIdentitySeparatesClientsAndIgnoresSpoofedForwardedFor() throws Exception {
+        DisposableServer backend = HttpServer.create().port(0)
+                .handle((request, response) -> response.sendString(Mono.just("ok"))).bindNow();
+        String origin = "http://127.0.0.1:" + backend.port();
+        GatewayConfig config = new GatewayConfig(1, 3, List.of(new GatewayConfig.RouteDefinition(
+                "client", "/client", List.of(origin), new GatewayConfig.PolicyDefinition(
+                        1, 0.000001, RateLimitPolicy.KeyType.CLIENT_IP,
+                        RateLimitPolicy.RedisFailureMode.LOCAL_FALLBACK, List.of()))));
+        GatewayProxy proxy = new GatewayProxy(config, new LocalTokenBucketRateLimiter(),
+                new GatewayMetrics(), new AccessLogger(s -> {}), UpstreamAllowlist.fromCsv(origin, true),
+                ClientIdentityResolver.fromCsv("127.0.0.1", true));
+        DisposableServer gateway = proxy.start(0);
+        try {
+            var client = java.net.http.HttpClient.newHttpClient();
+            String url = "http://127.0.0.1:" + gateway.port() + "/client";
+            var first = client.send(HttpRequest.newBuilder(URI.create(url))
+                    .header("X-Real-IP", "192.0.2.10")
+                    .header("X-Forwarded-For", "198.51.100.99").GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            var second = client.send(HttpRequest.newBuilder(URI.create(url))
+                    .header("X-Real-IP", "192.0.2.11").GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            var sameClient = client.send(HttpRequest.newBuilder(URI.create(url))
+                    .header("X-Real-IP", "192.0.2.10")
+                    .header("X-Forwarded-For", "198.51.100.100").GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            var missingIdentity = client.send(HttpRequest.newBuilder(URI.create(url)).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            assertEquals(200, first.statusCode());
+            assertEquals(200, second.statusCode());
+            assertEquals(429, sameClient.statusCode());
+            assertEquals(403, missingIdentity.statusCode());
         } finally {
             gateway.disposeNow();
             backend.disposeNow();

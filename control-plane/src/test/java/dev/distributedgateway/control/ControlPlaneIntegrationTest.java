@@ -16,7 +16,9 @@ import org.springframework.boot.test.context.SpringBootTest;
         "spring.datasource.username=sa",
         "spring.datasource.password=",
         "control.token=test-secret",
-        "control.seed-file=../config/gateway.properties"
+        "control.seed-file=../config/gateway.properties",
+        "gateway.allowed-upstreams=http://localhost:8081,http://localhost:8082,http://localhost:8083",
+        "gateway.require-allowlist=true"
 })
 class ControlPlaneIntegrationTest {
     @Value("${local.server.port}")
@@ -32,9 +34,10 @@ class ControlPlaneIntegrationTest {
 
         String publish = """
                 {"expectedVersion":1,"responseTimeoutSeconds":4,"routes":[
-                  {"id":"demo","pathPrefix":"/demo","upstreams":["http://localhost:9999"],"policy":null}
+                  {"id":"demo","pathPrefix":"/demo","upstreams":["http://localhost:8081"],"policy":null}
                 ]}
                 """;
+        assertEquals(400, request(base + "/admin/config/versions", "POST", publish.replace("localhost:8081", "localhost:9999"), true).statusCode());
         assertEquals(201, request(base + "/admin/config/versions", "POST", publish, true).statusCode());
         assertTrue(request(base + "/internal/config/active", "GET", null, true).body().contains("snapshot.version=2"));
         assertEquals(409, request(base + "/admin/config/versions", "POST", publish, true).statusCode());

@@ -5,7 +5,6 @@ import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.timeout.ReadTimeoutException;
-import java.net.SocketAddress;
 import java.net.URI;
 import java.time.Duration;
 import java.util.List;
@@ -44,6 +43,8 @@ public final class GatewayProxy {
     private final LoadBalancer loadBalancer;
     private final GatewayMetrics metrics;
     private final AccessLogger accessLogger;
+    private UpstreamAllowlist upstreamAllowlist = UpstreamAllowlist.allowAllForLocalUse();
+    private ClientIdentityResolver clientIdentityResolver = ClientIdentityResolver.direct();
     private boolean draining;
 
     private static final class Observation {
@@ -107,15 +108,29 @@ public final class GatewayProxy {
     }
 
     public GatewayProxy(GatewayConfig config, RateLimiter rateLimiter, GatewayMetrics metrics, AccessLogger accessLogger) {
+        this(config, rateLimiter, metrics, accessLogger, UpstreamAllowlist.allowAllForLocalUse());
+    }
+
+    public GatewayProxy(GatewayConfig config, RateLimiter rateLimiter, GatewayMetrics metrics,
+            AccessLogger accessLogger, UpstreamAllowlist upstreamAllowlist) {
+        this(config, rateLimiter, metrics, accessLogger, upstreamAllowlist, ClientIdentityResolver.direct());
+    }
+
+    public GatewayProxy(GatewayConfig config, RateLimiter rateLimiter, GatewayMetrics metrics,
+            AccessLogger accessLogger, UpstreamAllowlist upstreamAllowlist,
+            ClientIdentityResolver clientIdentityResolver) {
         this(config.compiledRoutes(), Duration.ofSeconds(config.responseTimeoutSeconds()),
                 config.compiledPolicies(), rateLimiter, new LoadBalancer(), config.apiKeyVerifier(),
                 metrics, accessLogger);
+        this.upstreamAllowlist = Objects.requireNonNull(upstreamAllowlist);
+        this.clientIdentityResolver = Objects.requireNonNull(clientIdentityResolver);
         install(config);
     }
 
     /** All derived objects are built before the active pointer changes. */
     public synchronized void install(GatewayConfig config) {
         Objects.requireNonNull(config);
+        upstreamAllowlist.validate(config);
         if (config.version() <= active.get().version()) {
             throw new IllegalArgumentException("Configuration version must increase");
         }
@@ -172,6 +187,11 @@ public final class GatewayProxy {
             return response.status(HttpResponseStatus.SERVICE_UNAVAILABLE)
                     .sendString(Mono.just("Gateway shutting down")).then();
         }
+        var resolvedClientIp = clientIdentityResolver.resolve(request);
+        if (resolvedClientIp.isEmpty()) {
+            return response.status(HttpResponseStatus.FORBIDDEN)
+                    .sendString(Mono.just("Untrusted client identity")).then();
+        }
         if (!admitRequest()) {
             return response.status(HttpResponseStatus.SERVICE_UNAVAILABLE)
                     .header("Retry-After", "1")
@@ -180,8 +200,7 @@ public final class GatewayProxy {
 
         String method = request.method().name();
         String path = uri.split("\\?", 2)[0];
-        SocketAddress remote = request.remoteAddress();
-        String clientIp = remote != null ? remote.toString() : "-";
+        String clientIp = resolvedClientIp.orElseThrow();
         Observation observation = new Observation(method, path, clientIp);
         String contentLength = request.requestHeaders().get(HttpHeaderNames.CONTENT_LENGTH);
         if (contentLength != null) {
@@ -214,7 +233,7 @@ public final class GatewayProxy {
             return observe(forward(request, response, route, null, snapshot, observation), observation);
         }
 
-        var rateLimitKey = RateLimitKeyResolver.resolveKey(request, route, policy, snapshot.apiKeyVerifier());
+        var rateLimitKey = RateLimitKeyResolver.resolveKey(request, route, policy, snapshot.apiKeyVerifier(), clientIp);
         if (rateLimitKey.isEmpty()) {
             observation.status = HttpResponseStatus.UNAUTHORIZED.code();
             return observe(response.status(HttpResponseStatus.UNAUTHORIZED)
@@ -234,6 +253,12 @@ public final class GatewayProxy {
                             .header("X-RateLimit-Remaining", String.valueOf(decision.remaining()))
                             .header("Retry-After", String.valueOf(decision.retryAfterSeconds()));
                     return response.sendString(Mono.just("Rate limit exceeded")).then();
+                })
+                .onErrorResume(RateLimitUnavailableException.class, error -> {
+                    observation.status = HttpResponseStatus.SERVICE_UNAVAILABLE.code();
+                    return response.status(HttpResponseStatus.SERVICE_UNAVAILABLE)
+                            .header("Retry-After", "1")
+                            .sendString(Mono.just("Rate limit service unavailable")).then();
                 })
                 .transform(result -> observe(result, observation));
     }

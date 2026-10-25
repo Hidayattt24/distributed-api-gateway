@@ -20,8 +20,9 @@ public record GatewayRoute(String id, String pathPrefix, List<URI> upstreams) {
             throw new IllegalArgumentException("Route must have at least one upstream");
         }
         for (URI upstream : upstreams) {
-            if (upstream == null || !"http".equalsIgnoreCase(upstream.getScheme()) || upstream.getHost() == null) {
-                throw new IllegalArgumentException("Upstream must be an absolute HTTP URL");
+            if (upstream == null || !("http".equalsIgnoreCase(upstream.getScheme())
+                    || "https".equalsIgnoreCase(upstream.getScheme())) || upstream.getHost() == null) {
+                throw new IllegalArgumentException("Upstream must be an absolute HTTP(S) URL");
             }
         }
         upstreams = List.copyOf(upstreams);
