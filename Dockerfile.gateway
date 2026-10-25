@@ -3,7 +3,8 @@ WORKDIR /app
 COPY . .
 RUN sh ./gradlew :gateway:gateway-runtime:installDist --no-daemon
 
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:21-jre-alpine-3.24
+RUN apk upgrade --no-cache brotli-libs
 WORKDIR /app
 COPY --from=build /app/gateway/gateway-runtime/build/install/gateway-runtime /app/gateway
 COPY config/gateway.properties /app/config/gateway.properties

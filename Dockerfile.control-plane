@@ -3,7 +3,8 @@ WORKDIR /app
 COPY . .
 RUN sh ./gradlew :control-plane:bootJar --no-daemon
 
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:21-jre-alpine-3.24
+RUN apk upgrade --no-cache brotli-libs
 WORKDIR /app
 COPY --from=build /app/control-plane/build/libs/control-plane-*.jar /app/control-plane.jar
 COPY config/gateway.properties /app/config/gateway.properties
