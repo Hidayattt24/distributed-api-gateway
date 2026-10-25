@@ -1,0 +1,72 @@
+name: distributed-api-gateway-production
+
+services:
+  edge:
+    image: nginx:1.27-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs/fullchain.pem:/etc/nginx/tls/fullchain.pem:ro
+      - ./certs/privkey.pem:/etc/nginx/tls/privkey.pem:ro
+    networks:
+      public: {}
+      ingress:
+        ipv4_address: 172.28.10.2
+    depends_on:
+      - gateway-a
+      - gateway-b
+    restart: unless-stopped
+
+  gateway-a: &gateway
+    image: ${GATEWAY_IMAGE:?Set GATEWAY_IMAGE to a scanned immutable image digest}
+    environment: &gateway-env
+      GATEWAY_CONFIG: /app/config/production.properties
+      GATEWAY_MANAGEMENT_HOST: 0.0.0.0
+      GATEWAY_ALLOWED_UPSTREAMS: ${GATEWAY_ALLOWED_UPSTREAMS:?Set exact allowed origins}
+      GATEWAY_REQUIRE_UPSTREAM_ALLOWLIST: "true"
+      GATEWAY_TRUSTED_PROXY_IPS: 172.28.10.2
+      GATEWAY_REQUIRE_TRUSTED_PROXY: "true"
+      API_SERVICE_URL: ${API_SERVICE_URL:?Set API_SERVICE_URL}
+      RATE_LIMIT_API_API_KEY_SHA256: ${RATE_LIMIT_API_API_KEY_SHA256:?Set API key SHA-256}
+      REDIS_URL: ${REDIS_URL:?Set HA Redis URL}
+      CONTROL_PLANE_URL: http://control-plane:9090/internal/config/active
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:?Set control plane token}
+    volumes:
+      - ./gateway.properties:/app/config/production.properties:ro
+    networks:
+      - ingress
+      - backend
+    restart: unless-stopped
+
+  gateway-b:
+    <<: *gateway
+    environment: *gateway-env
+
+  control-plane:
+    image: ${CONTROL_PLANE_IMAGE:?Set CONTROL_PLANE_IMAGE to a scanned immutable image digest}
+    environment:
+      CONTROL_SEED_FILE: /app/config/production.properties
+      CONTROL_DATABASE_URL: ${CONTROL_DATABASE_URL:?Set PostgreSQL URL}
+      CONTROL_DATABASE_USER: ${CONTROL_DATABASE_USER:?Set PostgreSQL user}
+      CONTROL_DATABASE_PASSWORD: ${CONTROL_DATABASE_PASSWORD:?Set PostgreSQL password}
+      CONTROL_PLANE_TOKEN: ${CONTROL_PLANE_TOKEN:?Set control plane token}
+      GATEWAY_ALLOWED_UPSTREAMS: ${GATEWAY_ALLOWED_UPSTREAMS:?Set exact allowed origins}
+      GATEWAY_REQUIRE_UPSTREAM_ALLOWLIST: "true"
+      API_SERVICE_URL: ${API_SERVICE_URL:?Set API_SERVICE_URL}
+      RATE_LIMIT_API_API_KEY_SHA256: ${RATE_LIMIT_API_API_KEY_SHA256:?Set API key SHA-256}
+    volumes:
+      - ./gateway.properties:/app/config/production.properties:ro
+    networks:
+      - backend
+    restart: unless-stopped
+
+networks:
+  public: {}
+  ingress:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24
+  backend: {}

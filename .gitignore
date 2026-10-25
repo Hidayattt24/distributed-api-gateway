@@ -6,6 +6,8 @@
 *.iml
 *.log
 .env
+deploy/production/certs/
+deploy/production/.env
 
 # docs & opencode
 .opencode/
