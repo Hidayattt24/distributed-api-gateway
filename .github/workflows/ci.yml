@@ -51,10 +51,43 @@ jobs:
           CONTROL_DATABASE_PASSWORD: ci-placeholder-database
           CONTROL_PLANE_TOKEN: ci-placeholder-token
           GRAFANA_ADMIN_PASSWORD: ci-placeholder-grafana
+      - name: Validate production Compose
+        run: docker compose -f deploy/production/compose.yaml config --quiet
+        env:
+          GATEWAY_IMAGE: distributed-api-gateway:ci
+          CONTROL_PLANE_IMAGE: distributed-api-gateway-control-plane:ci
+          API_SERVICE_URL: http://api-service:8080
+          GATEWAY_ALLOWED_UPSTREAMS: http://api-service:8080
+          RATE_LIMIT_API_API_KEY_SHA256: ci-placeholder
+          REDIS_URL: redis://redis:6379
+          CONTROL_DATABASE_URL: jdbc:postgresql://postgres:5432/gateway
+          CONTROL_DATABASE_USER: gateway
+          CONTROL_DATABASE_PASSWORD: ci-placeholder
+          CONTROL_PLANE_TOKEN: ci-placeholder
       - name: Build gateway image
         run: docker build -f Dockerfile.gateway -t distributed-api-gateway:${{ github.sha }} .
       - name: Build control-plane image
         run: docker build -f Dockerfile.control-plane -t distributed-api-gateway-control-plane:${{ github.sha }} .
+      - name: Scan repository dependencies
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+      - name: Scan gateway image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: distributed-api-gateway:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+      - name: Scan control-plane image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: distributed-api-gateway-control-plane:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: '1'
       - name: Generate checksums
         run: |
           sha256sum gateway/gateway-runtime/build/distributions/*.zip control-plane/build/libs/*.jar > SHA256SUMS.txt

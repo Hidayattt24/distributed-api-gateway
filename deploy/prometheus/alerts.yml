@@ -1,0 +1,22 @@
+groups:
+  - name: gateway
+    rules:
+      - alert: GatewayUnavailable
+        expr: up{job="distributed-api-gateway"} == 0
+        for: 1m
+        labels:
+          severity: critical
+      - alert: GatewayHigh5xxRate
+        expr: sum(rate(gateway_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(gateway_requests_total[5m])), 0.001) > 0.02
+        for: 5m
+        labels:
+          severity: critical
+      - alert: GatewayRateLimitSpike
+        expr: sum(rate(gateway_rate_limited_total[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+      - alert: GatewayRedisFailure
+        expr: sum(increase(gateway_redis_failures_total[5m])) > 0
+        labels:
+          severity: critical
