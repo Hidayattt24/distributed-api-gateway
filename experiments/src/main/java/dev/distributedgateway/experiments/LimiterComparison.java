@@ -1,6 +1,5 @@
 package dev.distributedgateway.experiments;
 
-import dev.distributedgateway.core.LocalFixedWindowRateLimiter;
 import dev.distributedgateway.core.LocalTokenBucketRateLimiter;
 import dev.distributedgateway.core.RateLimitPolicy;
 import dev.distributedgateway.core.RateLimiter;
@@ -86,7 +85,7 @@ public final class LimiterComparison {
     }
 
     private static String report(List<Result> results) {
-        StringBuilder out = new StringBuilder("# M7 limiter comparison\n\n"
+        StringBuilder out = new StringBuilder("# Rate limiter comparison\n\n"
                 + "Hypothesis: with capacity 10 and refill 5/s, a fixed window admits a larger burst "
                 + "across its two-second boundary. Per-client keys isolate clients but raise total allowance.\n\n"
                 + "Method: deterministic virtual time, sequential decisions, fresh local limiter for every row. "

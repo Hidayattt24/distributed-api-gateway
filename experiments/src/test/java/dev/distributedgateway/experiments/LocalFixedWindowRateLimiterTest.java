@@ -1,9 +1,10 @@
-package dev.distributedgateway.core;
+package dev.distributedgateway.experiments;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import dev.distributedgateway.core.RateLimitPolicy;
 import java.util.List;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;

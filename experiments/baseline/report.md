@@ -1,4 +1,4 @@
-# M7 limiter comparison
+# Rate limiter comparison
 
 Hypothesis: with capacity 10 and refill 5/s, a fixed window admits a larger burst across its two-second boundary. Per-client keys isolate clients but raise total allowance.
 

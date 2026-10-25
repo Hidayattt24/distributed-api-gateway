@@ -1,4 +1,4 @@
-# M7 experiments
+# Rate limiter experiments
 
 Run the deterministic local comparison on JDK 21:
 
