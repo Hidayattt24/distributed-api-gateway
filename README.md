@@ -439,7 +439,6 @@ To run tests with task re-execution:
 ## Experiments and release preparation
 
 - [Rate limiter comparison](experiments/README.md): deterministic token bucket versus fixed-window baseline, with [recorded results](experiments/baseline/report.md) and raw CSV. Fixed window is an experiment, not a live policy.
-- [Custom backend example](examples/custom-backend/README.md): run the gateway against a Python HTTP service instead of PetClinic.
 - [Release guide](RELEASING.md), [changelog](CHANGELOG.md), [contributing guide](CONTRIBUTING.md), [security policy](SECURITY.md), and [Apache-2.0 license](LICENSE).
 
 Version `0.1.0` source is prepared locally. The gateway ZIP includes `LICENSE` and starter `config/gateway.properties`. CI builds tests, distribution archives and images; no GitHub Release or registry image has been published. Read [SECURITY.md](SECURITY.md) and verify the release checklist before considering any public deployment.
